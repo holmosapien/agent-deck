@@ -13,6 +13,8 @@ import (
 
 	"github.com/creack/pty"
 	"github.com/gorilla/websocket"
+
+	"github.com/asheshgoplani/agent-deck/internal/tmux"
 )
 
 var ErrTmuxSessionNotFound = errors.New("tmux session not found")
@@ -193,7 +195,7 @@ func tmuxCommand(args ...string) *exec.Cmd {
 		finalArgs = append([]string{"-S", socketPath}, args...)
 	}
 
-	cmd := exec.Command("tmux", finalArgs...)
+	cmd := tmux.TmuxCommand( finalArgs...)
 	if hasSocket {
 		cmd.Env = environWithoutTMUX(os.Environ())
 	}

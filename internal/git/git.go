@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -602,4 +603,49 @@ func PruneWorktrees(repoDir string) error {
 		return fmt.Errorf("failed to prune worktrees: %s: %w", strings.TrimSpace(string(output)), err)
 	}
 	return nil
+}
+
+var githubRE = regexp.MustCompile(`(?:https://github\.com/|git@github\.com:|ssh://git@github\.com/)([^/]+)/([^/.]+)(?:\.git)?`)
+
+// GetRemoteURL returns the URL of the given remote (e.g. "origin")
+func GetRemoteURL(dir, remote string) (string, error) {
+	cmd := exec.Command("git", "-C", dir, "remote", "get-url", remote)
+	output, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("failed to get remote URL: %w", err)
+	}
+	return strings.TrimSpace(string(output)), nil
+}
+
+// ParseGitHubURL parses a GitHub URL and returns the owner and repo name
+func ParseGitHubURL(url string) (owner, repo string, ok bool) {
+	matches := githubRE.FindStringSubmatch(url)
+	if len(matches) == 3 {
+		return matches[1], matches[2], true
+	}
+	return "", "", false
+}
+
+// GetUncommittedStats returns the number of uncommitted additions and deletions
+func GetUncommittedStats(dir string) (additions, deletions int, err error) {
+	// git diff HEAD --numstat gets additions and deletions for all changes (staged and unstaged)
+	cmd := exec.Command("git", "-C", dir, "diff", "HEAD", "--numstat")
+	output, err := cmd.Output()
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to get diff stats: %w", err)
+	}
+
+	scanner := bufio.NewScanner(strings.NewReader(string(output)))
+	for scanner.Scan() {
+		line := scanner.Text()
+		fields := strings.Fields(line)
+		if len(fields) >= 2 {
+			add, _ := strconv.Atoi(fields[0])
+			del, _ := strconv.Atoi(fields[1])
+			additions += add
+			deletions += del
+		}
+	}
+
+	return additions, deletions, nil
 }

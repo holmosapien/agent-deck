@@ -89,7 +89,7 @@ func NewControlPipe(sessionName string) (*ControlPipe, error) {
 }
 
 func newControlPipeOnce(sessionName string) (*ControlPipe, error) {
-	cmd := exec.Command("tmux", "-C", "attach-session", "-t", sessionName)
+	cmd := TmuxCommand("-C", "attach-session", "-t", sessionName)
 	// Put in own process group so we can kill the entire group on shutdown
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 

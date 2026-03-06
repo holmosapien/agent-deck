@@ -84,7 +84,7 @@ func (s *Session) Attach(ctx context.Context, detachByte ...byte) error {
 	defer cancel()
 
 	// Start tmux attach command with PTY
-	cmd := exec.CommandContext(ctx, "tmux", "attach-session", "-t", s.Name)
+	cmd := TmuxCommandContext(ctx, "attach-session", "-t", s.Name)
 
 	// Start command with PTY
 	ptmx, err := pty.Start(cmd)
@@ -300,7 +300,7 @@ func (s *Session) AttachWindow(ctx context.Context, windowIndex int, detachByte 
 // Resize changes the terminal size of the tmux session
 func (s *Session) Resize(cols, rows int) error {
 	// Resize the tmux window
-	cmd := exec.Command("tmux", "resize-window", "-t", s.Name, "-x", fmt.Sprintf("%d", cols), "-y", fmt.Sprintf("%d", rows))
+	cmd := TmuxCommand("resize-window", "-t", s.Name, "-x", fmt.Sprintf("%d", cols), "-y", fmt.Sprintf("%d", rows))
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("failed to resize window: %w", err)
 	}
@@ -321,7 +321,7 @@ func (s *Session) AttachReadOnly(ctx context.Context) error {
 	defer func() { _ = term.Restore(int(os.Stdin.Fd()), oldState) }()
 
 	// Start tmux attach command in read-only mode
-	cmd := exec.CommandContext(ctx, "tmux", "attach-session", "-r", "-t", s.Name)
+	cmd := TmuxCommandContext(ctx, "attach-session", "-r", "-t", s.Name)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -352,7 +352,7 @@ func (s *Session) StreamOutput(ctx context.Context, w io.Writer) error {
 	}
 
 	// Use tmux pipe-pane to stream output
-	cmd := exec.CommandContext(ctx, "tmux", "pipe-pane", "-t", s.Name, "-o", "cat")
+	cmd := TmuxCommandContext(ctx, "pipe-pane", "-t", s.Name, "-o", "cat")
 	cmd.Stdout = w
 	cmd.Stderr = os.Stderr
 
@@ -374,7 +374,7 @@ func (s *Session) StreamOutput(ctx context.Context, w io.Writer) error {
 	case <-ctx.Done():
 		// Stop pipe-pane - error is intentionally ignored since we're
 		// already returning ctx.Err() and cleanup failure is non-fatal
-		stopCmd := exec.Command("tmux", "pipe-pane", "-t", s.Name)
+		stopCmd := TmuxCommand("pipe-pane", "-t", s.Name)
 		_ = stopCmd.Run()
 		// Wait for the goroutine to complete before returning
 		wg.Wait()
