@@ -1,7 +1,6 @@
 package tmux
 
 import (
-	"os/exec"
 	"testing"
 	"time"
 
@@ -115,12 +114,12 @@ func TestRefreshPaneInfoCache(t *testing.T) {
 
 	// Create a test session to ensure there's at least one pane
 	sessName := SessionPrefix + "title_detection_test"
-	cmd := exec.Command("tmux", "new-session", "-d", "-s", sessName)
+	cmd := TmuxCommand("new-session", "-d", "-s", sessName)
 	if err := cmd.Run(); err != nil {
 		t.Fatalf("Failed to create test session: %v", err)
 	}
 	defer func() {
-		_ = exec.Command("tmux", "kill-session", "-t", sessName).Run()
+		_ = TmuxCommand("kill-session", "-t", sessName).Run()
 	}()
 
 	// Refresh the cache

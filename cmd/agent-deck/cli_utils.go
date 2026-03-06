@@ -5,10 +5,10 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"os/exec"
 	"strings"
 
 	"github.com/asheshgoplani/agent-deck/internal/session"
+	"github.com/asheshgoplani/agent-deck/internal/tmux"
 )
 
 // normalizeArgs reorders args so flags come before positional arguments.
@@ -282,7 +282,7 @@ func GetCurrentSessionID() string {
 	}
 
 	// Get current tmux session name
-	cmd := exec.Command("tmux", "display-message", "-p", "#S")
+	cmd := tmux.TmuxCommand("display-message", "-p", "#S")
 	output, err := cmd.Output()
 	if err != nil {
 		return ""
