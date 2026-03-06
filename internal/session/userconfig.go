@@ -120,6 +120,15 @@ type UserConfig struct {
 
 	// OpenClaw defines OpenClaw gateway integration settings
 	OpenClaw OpenClawSettings `toml:"openclaw"`
+
+	// GitHub defines GitHub CLI integration settings
+	GitHub GitHubSettings `toml:"github"`
+}
+
+// GitHubSettings configures GitHub CLI integration.
+type GitHubSettings struct {
+	// ShowStats enables GitHub CLI integration (stats, PR info)
+	ShowStats bool `toml:"show_stats"`
 }
 
 // OpenClawSettings configures the OpenClaw gateway connection.
@@ -840,6 +849,10 @@ func (m *MCPDef) HasAutoStartServer() bool {
 //	inject_status_line = false
 //	options = { "allow-passthrough" = "all", "history-limit" = "50000" }
 type TmuxSettings struct {
+	// SocketName allows users to specify a custom tmux socket.
+	// This corresponds to the -L <socket-name> flag in tmux.
+	SocketName string `toml:"socket_name"`
+
 	// InjectStatusLine controls whether agent-deck injects a custom status line
 	// into new tmux sessions. When false, the tmux status bar is not modified,
 	// allowing users to use their own tmux status line configuration. This also
@@ -1510,6 +1523,8 @@ func GetTmuxSettings() TmuxSettings {
 	if err != nil || config == nil {
 		return TmuxSettings{}
 	}
+	// SIDE EFFECT: initialize tmux package
+	tmux.SetSocketName(config.Tmux.SocketName)
 	return config.Tmux
 }
 
@@ -1640,6 +1655,12 @@ func CreateExampleConfig() error {
 # Enable --yolo (bypass approvals and sandbox) by default (default: false)
 # yolo_mode = true
 
+# GitHub CLI integration
+# [github]
+# Enable GitHub CLI integration (stats, PR info) in session dashboard
+# Default: false
+# show_stats = true
+
 # Log file management
 # Agent-deck logs session output to ~/.agent-deck/logs/ for status detection
 # These settings control automatic log maintenance to prevent disk bloat
@@ -1701,6 +1722,8 @@ auto_cleanup = true
 # Tmux session settings
 # Controls how agent-deck configures tmux sessions
 # [tmux]
+# socket_name allows you to specify a custom tmux socket name (-L <name>)
+# socket_name = "custom"
 # inject_status_line controls whether agent-deck sets up a custom tmux status bar
 # When false, your existing tmux status line configuration is preserved and
 # agent-deck stops mutating the global tmux notification bar / number key bindings

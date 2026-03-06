@@ -2,7 +2,6 @@ package tmux
 
 import (
 	"fmt"
-	"os/exec"
 	"strings"
 	"sync"
 	"time"
@@ -120,7 +119,7 @@ func RefreshPaneInfoCache() {
 	}
 
 	// Subprocess fallback: list-panes -a
-	cmd := exec.Command("tmux", "list-panes", "-a", "-F", "#{session_name}\t#{pane_title}\t#{pane_current_command}\t#{pane_dead}\t#{window_index}\t#{pane_index}")
+	cmd := TmuxCommand("list-panes", "-a", "-F", "#{session_name}\t#{pane_title}\t#{pane_current_command}\t#{pane_dead}\t#{window_index}\t#{pane_index}")
 	output, err := cmd.Output()
 	if err != nil {
 		paneCacheMu.Lock()

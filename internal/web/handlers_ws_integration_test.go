@@ -15,17 +15,19 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+
+	"github.com/asheshgoplani/agent-deck/internal/tmux"
 )
 
 func TestWSEndpointTmuxBridgeIntegration(t *testing.T) {
 	requireTmuxForWebIntegration(t)
 
 	sessionName := fmt.Sprintf("agentdeck_web_it_%d", time.Now().UnixNano())
-	if output, err := exec.Command("tmux", "new-session", "-d", "-s", sessionName).CombinedOutput(); err != nil {
+	if output, err := tmux.TmuxCommand( "new-session", "-d", "-s", sessionName).CombinedOutput(); err != nil {
 		t.Skipf("tmux new-session unavailable: %v (%s)", err, strings.TrimSpace(string(output)))
 	}
 	defer func() {
-		_ = exec.Command("tmux", "kill-session", "-t", sessionName).Run()
+		_ = tmux.TmuxCommand( "kill-session", "-t", sessionName).Run()
 	}()
 
 	srv := NewServer(Config{
@@ -89,7 +91,7 @@ func requireTmuxForWebIntegration(t *testing.T) {
 	if _, err := exec.LookPath("tmux"); err != nil {
 		t.Skip("tmux not found in PATH")
 	}
-	if output, err := exec.Command("tmux", "-V").CombinedOutput(); err != nil {
+	if output, err := tmux.TmuxCommand( "-V").CombinedOutput(); err != nil {
 		t.Skipf("tmux not available: %v (%s)", err, strings.TrimSpace(string(output)))
 	}
 }

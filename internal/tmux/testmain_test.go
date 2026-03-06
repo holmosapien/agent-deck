@@ -15,7 +15,7 @@ func skipIfNoTmuxServer(t *testing.T) {
 		t.Skip("tmux not available")
 	}
 	// Check if tmux server is actually running (not just the binary existing)
-	if err := exec.Command("tmux", "list-sessions").Run(); err != nil {
+	if err := TmuxCommand("list-sessions").Run(); err != nil {
 		t.Skip("tmux server not running")
 	}
 }
@@ -44,7 +44,7 @@ func TestMain(m *testing.M) {
 // real user sessions with "test" in their title. Each test already has
 // defer Kill() which handles cleanup reliably (runs on panic, Fatal, etc).
 func cleanupTestSessions() {
-	out, err := exec.Command("tmux", "list-sessions", "-F", "#{session_name}").Output()
+	out, err := TmuxCommand("list-sessions", "-F", "#{session_name}").Output()
 	if err != nil {
 		return
 	}
@@ -52,7 +52,7 @@ func cleanupTestSessions() {
 	sessions := strings.Split(strings.TrimSpace(string(out)), "\n")
 	for _, sess := range sessions {
 		if strings.Contains(sess, "Test-Skip-Regen") {
-			_ = exec.Command("tmux", "kill-session", "-t", sess).Run()
+			_ = TmuxCommand("kill-session", "-t", sess).Run()
 		}
 	}
 }

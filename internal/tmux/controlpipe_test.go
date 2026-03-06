@@ -2,7 +2,6 @@ package tmux
 
 import (
 	"context"
-	"os/exec"
 	"strings"
 	"sync"
 	"testing"
@@ -19,11 +18,11 @@ func createTestSession(t *testing.T, suffix string) string {
 	skipIfNoTmuxServer(t)
 
 	name := SessionPrefix + "cptest-" + suffix
-	cmd := exec.Command("tmux", "new-session", "-d", "-s", name)
+	cmd := TmuxCommand("new-session", "-d", "-s", name)
 	require.NoError(t, cmd.Run(), "failed to create test session %s", name)
 
 	t.Cleanup(func() {
-		_ = exec.Command("tmux", "kill-session", "-t", name).Run()
+		_ = TmuxCommand("kill-session", "-t", name).Run()
 	})
 
 	return name
@@ -48,7 +47,7 @@ func TestControlPipe_CapturePaneVia(t *testing.T) {
 	name := createTestSession(t, "capture")
 
 	// Send some content to the session
-	_ = exec.Command("tmux", "send-keys", "-t", name, "echo hello-from-pipe-test", "Enter").Run()
+	_ = TmuxCommand("send-keys", "-t", name, "echo hello-from-pipe-test", "Enter").Run()
 	time.Sleep(300 * time.Millisecond)
 
 	pipe, err := NewControlPipe(name)
@@ -74,7 +73,7 @@ func TestControlPipe_OutputEvents(t *testing.T) {
 	drainEvents(pipe.OutputEvents(), 200*time.Millisecond)
 
 	// Send output to the session
-	_ = exec.Command("tmux", "send-keys", "-t", name, "echo output-event-test", "Enter").Run()
+	_ = TmuxCommand("send-keys", "-t", name, "echo output-event-test", "Enter").Run()
 
 	// Wait for output event
 	select {
@@ -149,7 +148,7 @@ func TestPipeManager_ConnectDisconnect(t *testing.T) {
 func TestPipeManager_CapturePane(t *testing.T) {
 	name := createTestSession(t, "pm-capture")
 
-	_ = exec.Command("tmux", "send-keys", "-t", name, "echo pm-capture-test", "Enter").Run()
+	_ = TmuxCommand("send-keys", "-t", name, "echo pm-capture-test", "Enter").Run()
 	time.Sleep(300 * time.Millisecond)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -205,7 +204,7 @@ func TestPipeManager_OutputCallback(t *testing.T) {
 	mu.Unlock()
 
 	// Generate output
-	_ = exec.Command("tmux", "send-keys", "-t", name, "echo callback-test", "Enter").Run()
+	_ = TmuxCommand("send-keys", "-t", name, "echo callback-test", "Enter").Run()
 
 	// Wait for callback
 	deadline := time.After(3 * time.Second)

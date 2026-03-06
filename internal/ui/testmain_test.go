@@ -2,9 +2,10 @@ package ui
 
 import (
 	"os"
-	"os/exec"
 	"strings"
 	"testing"
+
+	"github.com/asheshgoplani/agent-deck/internal/tmux"
 )
 
 // TestMain ensures all UI tests use the _test profile to prevent
@@ -31,7 +32,7 @@ func TestMain(m *testing.M) {
 // real user sessions with "test" in their title. Each test already has
 // defer Kill() which handles cleanup reliably (runs on panic, Fatal, etc).
 func cleanupTestSessions() {
-	out, err := exec.Command("tmux", "list-sessions", "-F", "#{session_name}").Output()
+	out, err := tmux.TmuxCommand( "list-sessions", "-F", "#{session_name}").Output()
 	if err != nil {
 		return
 	}
@@ -39,7 +40,7 @@ func cleanupTestSessions() {
 	sessions := strings.Split(strings.TrimSpace(string(out)), "\n")
 	for _, sess := range sessions {
 		if strings.Contains(sess, "Test-Skip-Regen") {
-			_ = exec.Command("tmux", "kill-session", "-t", sess).Run()
+			_ = tmux.TmuxCommand( "kill-session", "-t", sess).Run()
 		}
 	}
 }

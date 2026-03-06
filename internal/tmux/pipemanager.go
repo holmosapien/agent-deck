@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
-	"os/exec"
 	"strings"
 	"sync"
 	"time"
@@ -419,7 +418,7 @@ func (pm *PipeManager) watchPipe(sessionName string, pipe *ControlPipe) {
 
 // tmuxSessionExists checks if a tmux session exists (lightweight subprocess).
 func tmuxSessionExists(name string) bool {
-	cmd := exec.Command("tmux", "has-session", "-t", name)
+	cmd := TmuxCommand("has-session", "-t", name)
 	return cmd.Run() == nil
 }
 
