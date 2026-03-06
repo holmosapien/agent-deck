@@ -468,7 +468,7 @@ func killStaleControlClients(sessionName string) {
 
 // tmuxSessionExists checks if a tmux session exists (lightweight subprocess).
 func tmuxSessionExists(name string) bool {
-	cmd := exec.Command("tmux", "has-session", "-t", name)
+	cmd := TmuxCommand("has-session", "-t", name)
 	return cmd.Run() == nil
 }
 

@@ -3181,6 +3181,14 @@ func (h *Home) processStatusUpdate(req statusUpdateRequest) {
 			if inst.GetStatusThreadSafe() != oldStatus {
 				statusChanged = true
 			}
+
+			// Update PR status for visible git-backed sessions
+			oldPR := inst.GetPRStatusThreadSafe()
+			_ = inst.RefreshPRStatus()
+			if inst.GetPRStatusThreadSafe() != oldPR {
+				statusChanged = true
+			}
+
 			updated[inst.ID] = true
 		}
 	}
@@ -10351,16 +10359,17 @@ func (h *Home) renderSessionList(width, height int) string {
 
 	// Render items starting from viewOffset
 	visibleCount := 0
-	maxVisible := height - 1 // Leave room for scrolling indicator
-	if maxVisible < 1 {
-		maxVisible = 1
+	renderedLines := 0
+	maxVisibleLines := height - 1 // Leave room for scrolling indicator
+	if maxVisibleLines < 1 {
+		maxVisibleLines = 1
 	}
 
 	// Show "more above" indicator if scrolled down
 	if h.viewOffset > 0 {
 		b.WriteString(DimStyle.Render(fmt.Sprintf("  ⋮ +%d above", h.viewOffset)))
 		b.WriteString("\n")
-		maxVisible-- // Account for the indicator line
+		maxVisibleLines-- // Account for the indicator line
 	}
 
 	snapshot := h.getSessionRenderSnapshot()
@@ -10370,8 +10379,10 @@ func (h *Home) renderSessionList(width, height int) string {
 		jumpHints = generateJumpHints(len(h.flatItems))
 	}
 
-	for i := h.viewOffset; i < len(h.flatItems) && visibleCount < maxVisible; i++ {
+	for i := h.viewOffset; i < len(h.flatItems) && renderedLines < maxVisibleLines; i++ {
 		item := h.flatItems[i]
+
+		var itemStr string
 		if h.jumpMode && i < len(jumpHints) {
 			// Render item to temp buffer, then overlay hint badge at name position
 			var itemBuf strings.Builder
@@ -10385,18 +10396,29 @@ func (h *Home) renderSessionList(width, height int) string {
 				itemName := jumpItemName(item)
 				// Overlay hint on the first line, preserve rest exactly
 				if idx := strings.Index(raw, "\n"); idx >= 0 {
-					b.WriteString(h.overlayJumpHint(raw[:idx], hint, h.jumpBuffer, itemName))
-					b.WriteString(raw[idx:]) // includes \n and any subsequent lines
+					itemStr = h.overlayJumpHint(raw[:idx], hint, h.jumpBuffer, itemName) + raw[idx:]
 				} else {
-					b.WriteString(h.overlayJumpHint(raw, hint, h.jumpBuffer, itemName))
+					itemStr = h.overlayJumpHint(raw, hint, h.jumpBuffer, itemName)
 				}
 			} else {
 				// Non-matching: render normally (no dimming to preserve layout)
-				b.WriteString(raw)
+				itemStr = raw
 			}
 		} else {
-			h.renderItem(&b, item, i == h.cursor, i, groupStats, snapshot)
+			var itemBuf strings.Builder
+			h.renderItem(&itemBuf, item, i == h.cursor, i, groupStats, snapshot)
+			itemStr = itemBuf.String()
 		}
+
+		itemLines := strings.Count(itemStr, "\n")
+		// If this item would exceed the visible height, stop here
+		// (unless it's the first item, in which case we show at least one line)
+		if renderedLines+itemLines > maxVisibleLines && renderedLines > 0 {
+			break
+		}
+
+		b.WriteString(itemStr)
+		renderedLines += itemLines
 		visibleCount++
 	}
 
@@ -10482,13 +10504,161 @@ func (h *Home) renderItem(
 			h.renderCreatingSessionItem(b, item, selected)
 		} else {
 			h.renderSessionItem(b, item, selected, snapshot)
+			// If session has no windows or they are collapsed, render PR status here
+			if item.Session != nil {
+				tmuxSess := item.Session.GetTmuxSession()
+				if tmuxSess == nil {
+					// No tmux session yet, but we can still show branch/local changes
+					h.renderSessionPRStatus(b, item, item.Session)
+				} else {
+					wins := tmux.GetCachedWindows(tmuxSess.Name)
+					if len(wins) < 2 || h.windowsCollapsed[item.Session.ID] {
+						h.renderSessionPRStatus(b, item, item.Session)
+					}
+				}
+			}
 		}
 	case session.ItemTypeWindow:
 		h.renderWindowItem(b, item, selected)
+		// If this is the last window of the session, render the PR status below it
+		if item.IsLastWindow {
+			if sess := h.getSessionByID(item.WindowSessionID); sess != nil {
+				h.renderSessionPRStatus(b, item, sess)
+			}
+		}
 	case session.ItemTypeRemoteGroup:
 		h.renderRemoteGroupItem(b, item, selected)
 	case session.ItemTypeRemoteSession:
 		h.renderRemoteSessionItem(b, item, selected)
+	}
+}
+
+func (h *Home) getSessionByID(id string) *session.Instance {
+	// Use h.flatItems to find the session instance from its ID
+	for _, item := range h.flatItems {
+		if item.Type == session.ItemTypeSession && item.Session != nil && item.Session.ID == id {
+			return item.Session
+		}
+	}
+	return nil
+}
+
+// renderSessionPRStatus renders the Git/GitHub PR status lines for a session.
+// It is called either immediately after renderSessionItem (if no windows shown)
+// or after the last renderWindowItem for that session.
+func (h *Home) renderSessionPRStatus(b *strings.Builder, item session.Item, inst *session.Instance) {
+	pr := inst.GetPRStatusThreadSafe()
+	if pr == nil {
+		return
+	}
+
+	treeStyle := TreeConnectorStyle
+	// Use item.Level from the session or window item.
+	// For windows, item.Level is session.Level + 1, so we decrement it
+	// to align with the parent session's tree line.
+	level := item.Level
+	if item.Type == session.ItemTypeWindow {
+		level = item.Level - 1
+	}
+
+	// Calculate base indentation for parent levels
+	baseIndent := ""
+	if level > 1 {
+		// Use tree line continuation from ParentIsLastInGroup (for both session and window items)
+		groupIndent := strings.Repeat(treeEmpty, level-2)
+		if item.ParentIsLastInGroup {
+			baseIndent = groupIndent + "   "
+		} else {
+			baseIndent = groupIndent + " " + treeStyle.Render("│") + " "
+		}
+	}
+
+	// Indentation for status lines: baseIndent + selectionPrefix (1) + tree area (3 chars) + status area (2 chars)
+	// (Matching the spacing in row construction)
+	prIndent := baseIndent + "      "
+	if !item.IsLastInGroup {
+		// If not last in group, we need a │ continuation line at the session level
+		// Add leading space to align │ at position 1 (under ├ or │ of session row)
+		prIndent = baseIndent + " " + treeStyle.Render("│") + "    "
+	}
+
+	// Line 1: <branch name> <changes>
+	branchLine := prIndent + pr.Branch
+	if pr.LocalAdditions > 0 || pr.LocalDeletions > 0 {
+		branchLine += " "
+		if pr.LocalAdditions > 0 {
+			branchLine += lipgloss.NewStyle().Foreground(ColorGreen).Render(fmt.Sprintf("+%d", pr.LocalAdditions))
+		}
+		if pr.LocalAdditions > 0 && pr.LocalDeletions > 0 {
+			branchLine += " "
+		}
+		if pr.LocalDeletions > 0 {
+			branchLine += lipgloss.NewStyle().Foreground(ColorRed).Render(fmt.Sprintf("-%d", pr.LocalDeletions))
+		}
+	}
+	b.WriteString(branchLine + "\n")
+
+	// Only show PR details if it's not the default branch and we have a PR number
+	if !pr.IsDefault && pr.Number > 0 {
+		// Line 2: PR #<number> • <pr status> (<review icon>)
+		prColor := ColorYellow
+		if pr.State == "MERGED" {
+			prColor = ColorGreen
+		} else if pr.State == "CLOSED" {
+			prColor = ColorRed
+		}
+
+		reviewIcon := ""
+		decisionStyle := lipgloss.NewStyle().Foreground(ColorYellow)
+		if pr.ReviewDecision == "APPROVED" {
+			reviewIcon = " ✔"
+			decisionStyle = lipgloss.NewStyle().Foreground(ColorGreen)
+		} else if pr.ReviewDecision == "CHANGES_REQUESTED" {
+			reviewIcon = " ✘"
+			decisionStyle = lipgloss.NewStyle().Foreground(ColorRed)
+		}
+
+		prLine := fmt.Sprintf("%sPR #%d • %s%s",
+			prIndent,
+			pr.Number,
+			lipgloss.NewStyle().Foreground(prColor).Render(pr.State),
+			decisionStyle.Render(reviewIcon),
+		)
+
+		// PR additions and deletions
+		if pr.PRAdditions > 0 || pr.PRDeletions > 0 {
+			prLine += " • "
+			if pr.PRAdditions > 0 {
+				prLine += lipgloss.NewStyle().Foreground(ColorGreen).Render(fmt.Sprintf("+%d", pr.PRAdditions))
+			}
+			if pr.PRAdditions > 0 && pr.PRDeletions > 0 {
+				prLine += " "
+			}
+			if pr.PRDeletions > 0 {
+				prLine += lipgloss.NewStyle().Foreground(ColorRed).Render(fmt.Sprintf("-%d", pr.PRDeletions))
+			}
+		}
+		b.WriteString(prLine + "\n")
+
+		// Line 3: Checks summary
+		checksParts := []string{}
+		if pr.FailedChecks > 0 {
+			checksParts = append(checksParts, lipgloss.NewStyle().Foreground(ColorRed).Render(fmt.Sprintf("%d failed", pr.FailedChecks)))
+		}
+		if pr.SuccessfulChecks > 0 {
+			checksParts = append(checksParts, lipgloss.NewStyle().Foreground(ColorGreen).Render(fmt.Sprintf("%d successful", pr.SuccessfulChecks)))
+		}
+		if pr.SkippedChecks > 0 {
+			checksParts = append(checksParts, lipgloss.NewStyle().Foreground(ColorComment).Render(fmt.Sprintf("%d skipped", pr.SkippedChecks)))
+		}
+
+		if len(checksParts) > 0 {
+			checksLine := fmt.Sprintf("%sChecks: %s\n",
+				prIndent,
+				strings.Join(checksParts, ", "),
+			)
+			b.WriteString(checksLine)
+		}
 	}
 }
 

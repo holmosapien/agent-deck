@@ -28,6 +28,7 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/logging"
 	"github.com/asheshgoplani/agent-deck/internal/session"
 	"github.com/asheshgoplani/agent-deck/internal/statedb"
+	"github.com/asheshgoplani/agent-deck/internal/tmux"
 	"github.com/asheshgoplani/agent-deck/internal/ui"
 	"github.com/asheshgoplani/agent-deck/internal/update"
 	"github.com/asheshgoplani/agent-deck/internal/web"
@@ -191,6 +192,12 @@ func main() {
 		// Propagate explicit profile selection so config lookups (e.g., per-profile Claude config)
 		// resolve consistently across all command paths in this process.
 		_ = os.Setenv("AGENTDECK_PROFILE", profile)
+	}
+
+	// Extract global -L flag for custom tmux socket
+	socket, args := extractTmuxSocketFlag(args)
+	if socket != "" {
+		tmux.LockSocketName(socket)
 	}
 
 	var webEnabled bool
@@ -739,6 +746,35 @@ func extractGroupFlag(args []string) (string, []string) {
 	}
 
 	return group, remaining
+}
+
+// extractTmuxSocketFlag extracts -L from args, returning the socket name and remaining args
+func extractTmuxSocketFlag(args []string) (string, []string) {
+	var socket string
+	var remaining []string
+
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+
+		// Check for -L=value
+		if strings.HasPrefix(arg, "-L=") {
+			socket = strings.TrimPrefix(arg, "-L=")
+			continue
+		}
+
+		// Check for -L value
+		if arg == "-L" {
+			if i+1 < len(args) {
+				socket = args[i+1]
+				i++ // Skip the value
+				continue
+			}
+		}
+
+		remaining = append(remaining, arg)
+	}
+
+	return socket, remaining
 }
 
 // reorderArgsForFlagParsing moves the path argument to the end of args
@@ -2553,11 +2589,12 @@ func printHelp() {
 	fmt.Printf("Agent Deck v%s\n", Version)
 	fmt.Println("Terminal session manager for AI coding agents")
 	fmt.Println()
-	fmt.Println("Usage: agent-deck [-p profile] [-g group] [command]")
+	fmt.Println("Usage: agent-deck [-p profile] [-g group] [-L socket] [command]")
 	fmt.Println()
 	fmt.Println("Global Options:")
 	fmt.Println("  -p, --profile <name>   Use specific profile (default: 'default')")
 	fmt.Println("  -g, --group <name>     Launch TUI scoped to a specific group")
+	fmt.Println("  -L <socket>            Use custom tmux socket name")
 	fmt.Println()
 	fmt.Println("Commands:")
 	fmt.Println("  (none)           Start the TUI")

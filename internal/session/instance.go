@@ -26,6 +26,7 @@ import (
 	"al.essio.dev/pkg/shellescape"
 
 	"github.com/asheshgoplani/agent-deck/internal/docker"
+	"github.com/asheshgoplani/agent-deck/internal/git"
 	"github.com/asheshgoplani/agent-deck/internal/logging"
 	"github.com/asheshgoplani/agent-deck/internal/send"
 	"github.com/asheshgoplani/agent-deck/internal/tmux"
@@ -51,6 +52,80 @@ const (
 	StatusStarting Status = "starting" // Session is being created (tmux initializing)
 	StatusStopped  Status = "stopped"  // Session intentionally stopped by user (not crashed)
 )
+
+// PRInfo represents the status of a GitHub Pull Request
+type PRInfo struct {
+	Branch           string    `json:"branch,omitempty"`
+	IsDefault        bool      `json:"is_default,omitempty"`
+	Number           int       `json:"number,omitempty"`
+	State            string    `json:"state,omitempty"`
+	ReviewDecision   string    `json:"review_decision,omitempty"`
+	Mergeable        string    `json:"mergeable,omitempty"`
+	MergeStateStatus string    `json:"merge_state_status,omitempty"`
+	TotalChecks      int       `json:"total_checks,omitempty"`
+	SuccessfulChecks int       `json:"successful_checks,omitempty"`
+	SkippedChecks    int       `json:"skipped_checks,omitempty"`
+	FailedChecks     int       `json:"failed_checks,omitempty"`
+	UpdatedAt        time.Time `json:"updated_at,omitempty"`
+
+	// PR additions and deletions (from GitHub)
+	PRAdditions int `json:"pr_additions,omitempty"`
+	PRDeletions int `json:"pr_deletions,omitempty"`
+
+	// Local uncommitted changes
+	LocalAdditions int `json:"local_additions,omitempty"`
+	LocalDeletions int `json:"local_deletions,omitempty"`
+}
+
+var (
+	ghAvailable   bool
+	ghAuthChecked bool
+	ghAuthMu      sync.RWMutex
+)
+
+// ghCheckAuth checks if the gh CLI is installed and authenticated.
+// Results are cached for 1 hour to avoid repeated checks.
+func ghCheckAuth() bool {
+	ghAuthMu.RLock()
+	if ghAuthChecked {
+		avail := ghAvailable
+		ghAuthMu.RUnlock()
+		return avail
+	}
+	ghAuthMu.RUnlock()
+
+	ghAuthMu.Lock()
+	defer ghAuthMu.Unlock()
+
+	// Double-check after lock
+	if ghAuthChecked {
+		return ghAvailable
+	}
+
+	ghAuthChecked = true
+	ghAvailable = false
+
+	// 1. Check if gh is installed
+	if _, err := exec.LookPath("gh"); err != nil {
+		return false
+	}
+
+	// 2. Check if gh is authenticated
+	cmd := exec.Command("gh", "auth", "status")
+	if err := cmd.Run(); err != nil {
+		return false
+	}
+
+	ghAvailable = true
+	// Schedule re-check in 1 hour
+	time.AfterFunc(1*time.Hour, func() {
+		ghAuthMu.Lock()
+		ghAuthChecked = false
+		ghAuthMu.Unlock()
+	})
+
+	return true
+}
 
 const wrapperPlaceholder = "{command}"
 
@@ -179,6 +254,10 @@ type Instance struct {
 	// Each token is shellescape-quoted on emission so values with spaces
 	// survive the bash -c wrapper.
 	ExtraArgs []string `json:"extra_args,omitempty"`
+
+	// PR tracking - GitHub PR status
+	PR          *PRInfo   `json:"pr,omitempty"`
+	lastPRCheck time.Time `json:"-"` // Rate-limits expensive gh api calls
 
 	// ToolOptions stores tool-specific launch options (Claude, Codex, Gemini, etc.)
 	// JSON structure: {"tool": "claude", "options": {...}}
@@ -344,6 +423,13 @@ func (inst *Instance) GetStatusThreadSafe() Status {
 	s := inst.Status
 	inst.mu.RUnlock()
 	return s
+}
+
+// GetPRStatusThreadSafe returns the PR status with read-lock protection.
+func (inst *Instance) GetPRStatusThreadSafe() *PRInfo {
+	inst.mu.RLock()
+	defer inst.mu.RUnlock()
+	return inst.PR
 }
 
 // SetStatusThreadSafe sets the session status with write-lock protection.
@@ -1463,7 +1549,7 @@ func (i *Instance) collectTmuxPaneProcessTreePIDs() []int {
 	}
 
 	target := i.tmuxSession.Name + ":"
-	out, err := exec.Command("tmux", "list-panes", "-t", target, "-F", "#{pane_pid}").Output()
+	out, err := tmux.TmuxCommand( "list-panes", "-t", target, "-F", "#{pane_pid}").Output()
 	if err != nil {
 		return nil
 	}
@@ -2774,6 +2860,225 @@ func (i *Instance) UpdateStatus() error {
 			}
 		}
 	}
+
+	return nil
+}
+
+// RefreshPRStatus updates the PR status for this instance if it's a GitHub repository.
+func (i *Instance) RefreshPRStatus() error {
+	// Rate limit: 5 minutes between checks
+	i.mu.RLock()
+	if !i.lastPRCheck.IsZero() && time.Since(i.lastPRCheck) < 5*time.Minute {
+		i.mu.RUnlock()
+		return nil
+	}
+	i.mu.RUnlock()
+
+	projectPath := i.ProjectPath
+	if i.WorktreePath != "" {
+		projectPath = i.WorktreePath
+	}
+
+	if projectPath == "" || !git.IsGitRepo(projectPath) {
+		i.mu.Lock()
+		i.lastPRCheck = time.Now()
+		i.PR = nil
+		i.mu.Unlock()
+		return nil
+	}
+
+	branch, err := git.GetCurrentBranch(projectPath)
+	if err != nil {
+		return err
+	}
+
+	// Fetch local uncommitted stats
+	localAdd, localDel, _ := git.GetUncommittedStats(projectPath)
+
+	// Always initialize PR with at least the branch name if it's a git repo
+	// This ensures "Branch: <branch>" shows up even without a PR or on default branch
+	defaultBranch, _ := git.GetDefaultBranch(projectPath)
+	isDefault := (defaultBranch != "" && branch == defaultBranch)
+
+	// If it's the default branch, we don't look for a PR
+	if isDefault {
+		i.mu.Lock()
+		i.lastPRCheck = time.Now()
+		i.PR = &PRInfo{
+			Branch:         branch,
+			IsDefault:      true,
+			LocalAdditions: localAdd,
+			LocalDeletions: localDel,
+		}
+		i.mu.Unlock()
+		return nil
+	}
+
+	// Check if GitHub CLI is available and authenticated (and enabled in config)
+	config, _ := LoadUserConfig()
+	if config == nil || !config.GitHub.ShowStats || !ghCheckAuth() {
+		i.mu.Lock()
+		i.lastPRCheck = time.Now()
+		i.PR = &PRInfo{
+			Branch:         branch,
+			LocalAdditions: localAdd,
+			LocalDeletions: localDel,
+		}
+		i.mu.Unlock()
+		return nil
+	}
+
+	// Get origin remote URL
+	remoteURL, err := git.GetRemoteURL(projectPath, "origin")
+	if err != nil {
+		// Just show the branch name if no remote/origin
+		i.mu.Lock()
+		i.lastPRCheck = time.Now()
+		i.PR = &PRInfo{
+			Branch: branch,
+		}
+		i.mu.Unlock()
+		return nil
+	}
+
+	owner, repo, ok := git.ParseGitHubURL(remoteURL)
+	if !ok {
+		// Not a GitHub repository, just show the branch name
+		i.mu.Lock()
+		i.lastPRCheck = time.Now()
+		i.PR = &PRInfo{
+			Branch: branch,
+		}
+		i.mu.Unlock()
+		return nil
+	}
+
+	// Call gh api graphql
+	query := fmt.Sprintf(`
+query($owner: String!, $repo: String!) {
+  repository(owner: $owner, name: $repo) {
+    pullRequests(first: 1, headRefName: "%s") {
+      nodes {
+        number
+        title
+        state
+        additions
+        deletions
+        reviewDecision
+        mergeable
+        mergeStateStatus
+        updatedAt
+        statusCheckRollup {
+          contexts(first: 100) {
+            nodes {
+              ... on CheckRun {
+                status
+                conclusion
+              }
+              ... on StatusContext {
+                state
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}`, branch)
+
+	cmd := exec.Command("gh", "api", "graphql", "-f", "query="+query, "-f", "owner="+owner, "-f", "repo="+repo)
+	output, err := cmd.Output()
+	if err != nil {
+		// gh might not be installed or authenticated, show branch only
+		i.mu.Lock()
+		i.lastPRCheck = time.Now()
+		i.PR = &PRInfo{
+			Branch: branch,
+		}
+		i.mu.Unlock()
+		return fmt.Errorf("gh api failed: %w", err)
+	}
+
+	var response struct {
+		Data struct {
+			Repository struct {
+				PullRequests struct {
+					Nodes []struct {
+						Number           int    `json:"number"`
+						Title            string `json:"title"`
+						State            string    `json:"state"`
+						Additions        int       `json:"additions"`
+						Deletions        int       `json:"deletions"`
+						ReviewDecision   string    `json:"reviewDecision"`
+
+						Mergeable        string `json:"mergeable"`
+						MergeStateStatus string `json:"mergeStateStatus"`
+						UpdatedAt        string `json:"updatedAt"`
+						StatusCheckRollup struct {
+							Contexts struct {
+								Nodes []struct {
+									Status     string `json:"status"`     // CheckRun
+									Conclusion string `json:"conclusion"` // CheckRun
+									State      string `json:"state"`      // StatusContext
+								} `json:"nodes"`
+							} `json:"contexts"`
+						} `json:"statusCheckRollup"`
+					} `json:"nodes"`
+				} `json:"pullRequests"`
+			} `json:"repository"`
+		} `json:"data"`
+	}
+
+	if err := json.Unmarshal(output, &response); err != nil {
+		i.mu.Lock()
+		i.lastPRCheck = time.Now()
+		i.PR = &PRInfo{
+			Branch: branch,
+		}
+		i.mu.Unlock()
+		return fmt.Errorf("failed to unmarshal gh output: %w", err)
+	}
+
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	i.lastPRCheck = time.Now()
+
+	if len(response.Data.Repository.PullRequests.Nodes) == 0 {
+		i.PR = &PRInfo{
+			Branch:         branch,
+			LocalAdditions: localAdd,
+			LocalDeletions: localDel,
+		}
+		return nil
+	}
+
+	node := response.Data.Repository.PullRequests.Nodes[0]
+	pr := &PRInfo{
+		Branch:           branch,
+		Number:           node.Number,
+		State:            node.State,
+		PRAdditions:      node.Additions,
+		PRDeletions:      node.Deletions,
+		ReviewDecision:   node.ReviewDecision,
+		Mergeable:        node.Mergeable,
+		MergeStateStatus: node.MergeStateStatus,
+		LocalAdditions:   localAdd,
+		LocalDeletions:   localDel,
+	}
+	pr.UpdatedAt, _ = time.Parse(time.RFC3339, node.UpdatedAt)
+
+	for _, c := range node.StatusCheckRollup.Contexts.Nodes {
+		pr.TotalChecks++
+		if c.Conclusion == "SUCCESS" || c.State == "SUCCESS" {
+			pr.SuccessfulChecks++
+		} else if c.Conclusion == "SKIPPED" {
+			pr.SkippedChecks++
+		} else if c.Conclusion == "FAILURE" || c.Conclusion == "TIMED_OUT" || c.Conclusion == "CANCELLED" ||
+			c.State == "FAILURE" || c.State == "ERROR" {
+			pr.FailedChecks++
+		}
+	}
+	i.PR = pr
 
 	return nil
 }
@@ -5543,15 +5848,15 @@ func (i *Instance) OpenContainerShell() (string, error) {
 	// Kill any existing terminal session to prevent orphans from repeated T presses.
 	killCtx, killCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer killCancel()
-	_ = exec.CommandContext(killCtx, "tmux", "kill-session", "-t", tmuxName).Run()
+	_ = tmux.TmuxCommandContext(killCtx, "kill-session", "-t", tmuxName).Run()
 
 	// Omit -w flag: the container's workdir was set during create (respects worktree path).
 	// Pass the docker exec command as discrete tmux args to avoid shell interpolation of
 	// the container name (defence-in-depth against state file tampering).
 	newCtx, newCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer newCancel()
-	out, err := exec.CommandContext(newCtx,
-		"tmux", "new-session", "-d", "-s", tmuxName,
+	out, err := tmux.TmuxCommandContext(newCtx,
+		"new-session", "-d", "-s", tmuxName,
 		"docker", "exec", "-it", i.SandboxContainer, "/bin/sh",
 	).CombinedOutput()
 	if err != nil {

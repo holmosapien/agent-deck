@@ -2363,7 +2363,7 @@ func TestSession_SetsUpActivityMonitoring(t *testing.T) {
 	defer func() { _ = s.Kill() }()
 
 	// Verify monitor-activity is enabled
-	cmd := exec.Command("tmux", "show-options", "-t", s.Name, "-v", "monitor-activity")
+	cmd := TmuxCommand("show-options", "-t", s.Name, "-v", "monitor-activity")
 	output, err := cmd.Output()
 	require.NoError(t, err)
 	assert.Equal(t, "on", strings.TrimSpace(string(output)))
@@ -2378,12 +2378,12 @@ func TestSetStatusLeft(t *testing.T) {
 
 	// Create a test session
 	sessionName := "agentdeck_test_notification_" + fmt.Sprintf("%d", time.Now().UnixNano())
-	cmd := exec.Command("tmux", "new-session", "-d", "-s", sessionName)
+	cmd := TmuxCommand("new-session", "-d", "-s", sessionName)
 	if err := cmd.Run(); err != nil {
 		t.Fatalf("Failed to create test session: %v", err)
 	}
 	defer func() {
-		_ = exec.Command("tmux", "kill-session", "-t", sessionName).Run()
+		_ = TmuxCommand("kill-session", "-t", sessionName).Run()
 	}()
 
 	// Test setting status-left
@@ -2391,7 +2391,7 @@ func TestSetStatusLeft(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Verify it was set
-	out, err := exec.Command("tmux", "show-option", "-t", sessionName, "-v", "status-left").Output()
+	out, err := TmuxCommand("show-option", "-t", sessionName, "-v", "status-left").Output()
 	assert.NoError(t, err)
 	assert.Contains(t, string(out), "⚡ [1] test")
 }
@@ -2400,12 +2400,12 @@ func TestClearStatusLeft(t *testing.T) {
 	skipIfNoTmuxServer(t)
 
 	sessionName := "agentdeck_test_notification_" + fmt.Sprintf("%d", time.Now().UnixNano())
-	cmd := exec.Command("tmux", "new-session", "-d", "-s", sessionName)
+	cmd := TmuxCommand("new-session", "-d", "-s", sessionName)
 	if err := cmd.Run(); err != nil {
 		t.Fatalf("Failed to create test session: %v", err)
 	}
 	defer func() {
-		_ = exec.Command("tmux", "kill-session", "-t", sessionName).Run()
+		_ = TmuxCommand("kill-session", "-t", sessionName).Run()
 	}()
 
 	// Set then clear
@@ -2421,7 +2421,7 @@ func TestBindUnbindKey(t *testing.T) {
 
 	// Verify we can actually run tmux commands (bind-key may fail in CI
 	// even when tmux server is detected, e.g., no attached clients)
-	if err := exec.Command("tmux", "list-keys").Run(); err != nil {
+	if err := TmuxCommand("list-keys").Run(); err != nil {
 		t.Skip("tmux cannot list keys (no attached client?)")
 	}
 

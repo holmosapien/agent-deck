@@ -3,7 +3,6 @@ package tmux
 import (
 	"context"
 	"fmt"
-	"os/exec"
 	"strings"
 	"sync"
 	"time"
@@ -123,7 +122,7 @@ func RefreshPaneInfoCache() {
 	// Subprocess fallback: list-panes -a (3s timeout to prevent freeze when server is dead)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "tmux", "list-panes", "-a", "-F", "#{session_name}\t#{pane_title}\t#{pane_current_command}\t#{pane_dead}\t#{window_index}\t#{pane_index}")
+	cmd := TmuxCommandContext(ctx, "list-panes", "-a", "-F", "#{session_name}\t#{pane_title}\t#{pane_current_command}\t#{pane_dead}\t#{window_index}\t#{pane_index}")
 	output, err := cmd.Output()
 	if err != nil {
 		paneCacheMu.Lock()
