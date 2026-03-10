@@ -3184,7 +3184,7 @@ func (h *Home) processStatusUpdate(req statusUpdateRequest) {
 
 			// Update PR status for visible git-backed sessions
 			oldPR := inst.GetPRStatusThreadSafe()
-			_ = inst.RefreshPRStatus()
+			_ = inst.RefreshPRStatus(false)
 			if inst.GetPRStatusThreadSafe() != oldPR {
 				statusChanged = true
 			}
@@ -3544,14 +3544,15 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 				h.previewCacheMu.Lock()
 				h.previewFetchingID = selected.ID
 				h.previewCacheMu.Unlock()
-				// Batch preview fetch with any OpenCode detection commands
-				allCmds := append(detectionCmds, h.fetchPreview(selected, selected.ID, -1))
+				// Batch preview fetch with PR refresh and any OpenCode detection commands
+				allCmds := append(detectionCmds, h.fetchPreview(selected, selected.ID, -1), h.refreshAllPRStatus)
 				return h, tea.Batch(allCmds...)
 			}
 			// No selection, but still run detection commands if any
 			if len(detectionCmds) > 0 {
-				return h, tea.Batch(detectionCmds...)
+				return h, tea.Batch(append(detectionCmds, h.refreshAllPRStatus)...)
 			}
+			return h, h.refreshAllPRStatus
 		}
 		return h, nil
 
@@ -11139,6 +11140,41 @@ func (h *Home) renderWindowItem(b *strings.Builder, item session.Item, selected 
 	)
 	b.WriteString(row)
 	b.WriteString("\n")
+}
+
+// refreshAllPRStatus triggers an immediate, forced PR status refresh for all instances.
+// This is used on startup to ensure GitHub stats are shown as soon as possible.
+func (h *Home) refreshAllPRStatus() tea.Msg {
+	h.instancesMu.RLock()
+	instances := make([]*session.Instance, len(h.instances))
+	copy(instances, h.instances)
+	h.instancesMu.RUnlock()
+
+	// Use a wait group to run all checks in parallel (fast startup)
+	var wg sync.WaitGroup
+	for _, inst := range instances {
+		wg.Add(1)
+		go func(i *session.Instance) {
+			defer wg.Done()
+			_ = i.RefreshPRStatus(true) // Force = true to bypass startup rate limit
+		}(inst)
+	}
+
+	// Wait for all to complete (or time out after 10s to not block UI forever)
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// All complete
+	case <-time.After(10 * time.Second):
+		// Some might still be running, but we've waited enough for startup
+	}
+
+	return statusUpdateMsg{} // Trigger UI refresh
 }
 
 // renderLaunchingState renders the animated launching/resuming indicator for sessions

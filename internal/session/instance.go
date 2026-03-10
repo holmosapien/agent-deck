@@ -2865,10 +2865,11 @@ func (i *Instance) UpdateStatus() error {
 }
 
 // RefreshPRStatus updates the PR status for this instance if it's a GitHub repository.
-func (i *Instance) RefreshPRStatus() error {
-	// Rate limit: 5 minutes between checks
+// If force is true, the 5-minute rate limit is bypassed.
+func (i *Instance) RefreshPRStatus(force bool) error {
+	// Rate limit: 5 minutes between checks (unless forced)
 	i.mu.RLock()
-	if !i.lastPRCheck.IsZero() && time.Since(i.lastPRCheck) < 5*time.Minute {
+	if !force && !i.lastPRCheck.IsZero() && time.Since(i.lastPRCheck) < 5*time.Minute {
 		i.mu.RUnlock()
 		return nil
 	}
