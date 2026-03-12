@@ -1551,20 +1551,11 @@ func (h *Home) syncViewport() {
 		panelContentHeight = contentHeight - panelTitleLines
 	}
 
-	// maxVisible = how many items can be shown (reserving 1 for "more below" indicator)
-	maxVisible := panelContentHeight - 1
-	if maxVisible < 1 {
-		maxVisible = 1
-	}
-
-	// Account for "more above" indicator (takes 1 line when scrolled down)
-	// This is the key fix: when we're scrolled down, we have 1 less visible line
-	effectiveMaxVisible := maxVisible
-	if h.viewOffset > 0 {
-		effectiveMaxVisible-- // "more above" indicator takes 1 line
-	}
-	if effectiveMaxVisible < 1 {
-		effectiveMaxVisible = 1
+	// maxLines = how many terminal lines are available for list content
+	// Reserve 1 for the "more below" indicator
+	maxLines := panelContentHeight - 1
+	if maxLines < 1 {
+		maxLines = 1
 	}
 
 	// If cursor is above viewport, scroll up
@@ -1572,35 +1563,106 @@ func (h *Home) syncViewport() {
 		h.viewOffset = h.cursor
 	}
 
-	// If cursor is below viewport, scroll down
-	if h.cursor >= h.viewOffset+effectiveMaxVisible {
-		// When scrolling down, we need to account for the "more above" indicator
-		// that will appear once viewOffset > 0
-		if h.viewOffset == 0 {
-			// First scroll down: "more above" will appear, reducing visible by 1
-			h.viewOffset = h.cursor - (maxVisible - 1) + 1
+	// If cursor is below viewport, scroll down: advance viewOffset until cursor is visible
+	for !h.cursorFitsInViewport(maxLines) && h.viewOffset < h.cursor {
+		h.viewOffset++
+	}
+
+	// Clamp viewOffset: don't scroll past the point where last item is visible
+	for h.viewOffset > 0 {
+		prev := h.viewOffset - 1
+		if h.viewportItemCount(prev, maxLines) >= len(h.flatItems)-prev {
+			h.viewOffset = prev
 		} else {
-			// Already scrolled: "more above" already showing
-			h.viewOffset = h.cursor - effectiveMaxVisible + 1
+			break
 		}
 	}
 
-	// Clamp viewOffset to valid range
-	// When scrolled down, "more above" takes 1 line, so we can show fewer items
-	finalMaxVisible := maxVisible
-	if h.viewOffset > 0 {
-		finalMaxVisible--
-	}
-	maxOffset := len(h.flatItems) - finalMaxVisible
-	if maxOffset < 0 {
-		maxOffset = 0
-	}
-	if h.viewOffset > maxOffset {
-		h.viewOffset = maxOffset
-	}
 	if h.viewOffset < 0 {
 		h.viewOffset = 0
 	}
+}
+
+// cursorFitsInViewport returns true if the cursor item is visible given the current viewOffset.
+// It counts actual terminal lines (items may be multi-line due to PR status etc.)
+func (h *Home) cursorFitsInViewport(maxLines int) bool {
+	lines := 0
+	if h.viewOffset > 0 {
+		lines++ // "more above" indicator
+	}
+	for i := h.viewOffset; i < len(h.flatItems); i++ {
+		itemLines := h.itemLineCount(h.flatItems[i])
+		if lines+itemLines > maxLines {
+			return false // cursor item doesn't fit
+		}
+		lines += itemLines
+		if i == h.cursor {
+			return true
+		}
+	}
+	return true
+}
+
+// viewportItemCount returns how many items starting at offset fit within maxLines.
+func (h *Home) viewportItemCount(offset, maxLines int) int {
+	lines := 0
+	if offset > 0 {
+		lines++ // "more above" indicator
+	}
+	count := 0
+	for i := offset; i < len(h.flatItems); i++ {
+		itemLines := h.itemLineCount(h.flatItems[i])
+		if lines+itemLines > maxLines {
+			break
+		}
+		lines += itemLines
+		count++
+	}
+	return count
+}
+
+// itemLineCount returns the number of terminal lines an item occupies in the session list.
+// This mirrors the rendering logic in renderItem/renderSessionPRStatus.
+func (h *Home) itemLineCount(item session.Item) int {
+	lines := 1 // base: every item is at least 1 line
+	switch item.Type {
+	case session.ItemTypeSession:
+		if item.Session != nil {
+			pr := item.Session.GetPRStatusThreadSafe()
+			if pr != nil {
+				tmuxSess := item.Session.GetTmuxSession()
+				showPR := tmuxSess == nil
+				if !showPR {
+					wins := tmux.GetCachedWindows(tmuxSess.Name)
+					showPR = len(wins) < 2 || h.windowsCollapsed[item.Session.ID]
+				}
+				if showPR {
+					lines += prInfoLineCount(pr)
+				}
+			}
+		}
+	case session.ItemTypeWindow:
+		if item.IsLastWindow {
+			if sess := h.getSessionByID(item.WindowSessionID); sess != nil {
+				if pr := sess.GetPRStatusThreadSafe(); pr != nil {
+					lines += prInfoLineCount(pr)
+				}
+			}
+		}
+	}
+	return lines
+}
+
+// prInfoLineCount returns the number of lines renderSessionPRStatus writes for a given PRInfo.
+func prInfoLineCount(pr *session.PRInfo) int {
+	lines := 1 // branch line always written
+	if !pr.IsDefault && pr.Number > 0 {
+		lines++ // PR number/state line
+		if pr.FailedChecks > 0 || pr.SuccessfulChecks > 0 || pr.SkippedChecks > 0 {
+			lines++ // checks summary line
+		}
+	}
+	return lines
 }
 
 // NOTE: syncNotifications (foreground) was removed in v0.9.2 as a CPU optimization.
@@ -5730,6 +5792,7 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					}
 				}
 			}
+			h.syncViewport()
 			h.saveInstances()
 		}
 		return h, nil
@@ -5757,6 +5820,7 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					}
 				}
 			}
+			h.syncViewport()
 			h.saveInstances()
 		}
 		return h, nil
