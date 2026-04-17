@@ -998,6 +998,9 @@ func (s *Session) startCommandSpec(workDir, command string) (string, []string) {
 			"--property=TimeoutStopSec=15s",
 			"tmux",
 		}
+		if socketName != "" {
+			svcArgs = append(svcArgs, "-L", socketName)
+		}
 		svcArgs = append(svcArgs, tmuxArgs...)
 		return "systemd-run", svcArgs
 
@@ -1007,10 +1010,16 @@ func (s *Session) startCommandSpec(workDir, command string) (string, []string) {
 		scopeArgs := []string{
 			"--user", "--scope", "--quiet", "--collect", "--unit", unitBase, "tmux",
 		}
+		if socketName != "" {
+			scopeArgs = append(scopeArgs, "-L", socketName)
+		}
 		scopeArgs = append(scopeArgs, tmuxArgs...)
 		return "systemd-run", scopeArgs
 
 	default:
+		if socketName != "" {
+			return "tmux", append([]string{"-L", socketName}, tmuxArgs...)
+		}
 		return "tmux", tmuxArgs
 	}
 }
@@ -1091,7 +1100,7 @@ func StopServiceUnit(sessionName string) error {
 //	[4]   "--unit"
 //	[5]   "<unit name>"
 //	[6]   "tmux"
-//	[7..] tmux args
+//	[7..] tmux args  (may begin with "-L" "<socket>" when socketName is set)
 //
 // Service-mode shape (v1.7.21+):
 //
