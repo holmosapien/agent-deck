@@ -169,6 +169,9 @@ type UserConfig struct {
 
 	// Web defines `agent-deck web` HTTP server settings.
 	Web WebSettings `toml:"web"`
+
+	// GitHub defines GitHub CLI integration settings
+	GitHub GitHubSettings `toml:"github"`
 }
 
 // WebSettings configures the `agent-deck web` HTTP server.
@@ -186,6 +189,12 @@ type FeedbackSettings struct {
 	// Disabled suppresses all passive feedback prompts when true.
 	// Defaults to false. Set by RecordOptOut paths; cleared on re-enable.
 	Disabled bool `toml:"disabled"`
+}
+
+// GitHubSettings configures GitHub CLI integration.
+type GitHubSettings struct {
+	// ShowStats enables GitHub CLI integration (stats, PR info)
+	ShowStats bool `toml:"show_stats"`
 }
 
 // OpenClawSettings configures the OpenClaw gateway connection.
@@ -2367,6 +2376,12 @@ func CreateExampleConfig() error {
 # [codex]
 # Enable --yolo (bypass approvals and sandbox) by default (default: false)
 # yolo_mode = true
+
+# GitHub CLI integration
+# [github]
+# Enable GitHub CLI integration (stats, PR info) in session dashboard
+# Default: false
+# show_stats = true
 
 # Log file management
 # Agent-deck logs session output to ~/.agent-deck/logs/ for status detection

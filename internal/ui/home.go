@@ -1633,20 +1633,11 @@ func (h *Home) syncViewport() {
 		panelContentHeight = contentHeight - panelTitleLines
 	}
 
-	// maxVisible = how many items can be shown (reserving 1 for "more below" indicator)
-	maxVisible := panelContentHeight - 1
-	if maxVisible < 1 {
-		maxVisible = 1
-	}
-
-	// Account for "more above" indicator (takes 1 line when scrolled down)
-	// This is the key fix: when we're scrolled down, we have 1 less visible line
-	effectiveMaxVisible := maxVisible
-	if h.viewOffset > 0 {
-		effectiveMaxVisible-- // "more above" indicator takes 1 line
-	}
-	if effectiveMaxVisible < 1 {
-		effectiveMaxVisible = 1
+	// maxLines = how many terminal lines are available for list content
+	// Reserve 1 for the "more below" indicator
+	maxLines := panelContentHeight - 1
+	if maxLines < 1 {
+		maxLines = 1
 	}
 
 	// If cursor is above viewport, scroll up
@@ -1654,35 +1645,106 @@ func (h *Home) syncViewport() {
 		h.viewOffset = h.cursor
 	}
 
-	// If cursor is below viewport, scroll down
-	if h.cursor >= h.viewOffset+effectiveMaxVisible {
-		// When scrolling down, we need to account for the "more above" indicator
-		// that will appear once viewOffset > 0
-		if h.viewOffset == 0 {
-			// First scroll down: "more above" will appear, reducing visible by 1
-			h.viewOffset = h.cursor - (maxVisible - 1) + 1
+	// If cursor is below viewport, scroll down: advance viewOffset until cursor is visible
+	for !h.cursorFitsInViewport(maxLines) && h.viewOffset < h.cursor {
+		h.viewOffset++
+	}
+
+	// Clamp viewOffset: don't scroll past the point where last item is visible
+	for h.viewOffset > 0 {
+		prev := h.viewOffset - 1
+		if h.viewportItemCount(prev, maxLines) >= len(h.flatItems)-prev {
+			h.viewOffset = prev
 		} else {
-			// Already scrolled: "more above" already showing
-			h.viewOffset = h.cursor - effectiveMaxVisible + 1
+			break
 		}
 	}
 
-	// Clamp viewOffset to valid range
-	// When scrolled down, "more above" takes 1 line, so we can show fewer items
-	finalMaxVisible := maxVisible
-	if h.viewOffset > 0 {
-		finalMaxVisible--
-	}
-	maxOffset := len(h.flatItems) - finalMaxVisible
-	if maxOffset < 0 {
-		maxOffset = 0
-	}
-	if h.viewOffset > maxOffset {
-		h.viewOffset = maxOffset
-	}
 	if h.viewOffset < 0 {
 		h.viewOffset = 0
 	}
+}
+
+// cursorFitsInViewport returns true if the cursor item is visible given the current viewOffset.
+// It counts actual terminal lines (items may be multi-line due to PR status etc.)
+func (h *Home) cursorFitsInViewport(maxLines int) bool {
+	lines := 0
+	if h.viewOffset > 0 {
+		lines++ // "more above" indicator
+	}
+	for i := h.viewOffset; i < len(h.flatItems); i++ {
+		itemLines := h.itemLineCount(h.flatItems[i])
+		if lines+itemLines > maxLines {
+			return false // cursor item doesn't fit
+		}
+		lines += itemLines
+		if i == h.cursor {
+			return true
+		}
+	}
+	return true
+}
+
+// viewportItemCount returns how many items starting at offset fit within maxLines.
+func (h *Home) viewportItemCount(offset, maxLines int) int {
+	lines := 0
+	if offset > 0 {
+		lines++ // "more above" indicator
+	}
+	count := 0
+	for i := offset; i < len(h.flatItems); i++ {
+		itemLines := h.itemLineCount(h.flatItems[i])
+		if lines+itemLines > maxLines {
+			break
+		}
+		lines += itemLines
+		count++
+	}
+	return count
+}
+
+// itemLineCount returns the number of terminal lines an item occupies in the session list.
+// This mirrors the rendering logic in renderItem/renderSessionPRStatus.
+func (h *Home) itemLineCount(item session.Item) int {
+	lines := 1 // base: every item is at least 1 line
+	switch item.Type {
+	case session.ItemTypeSession:
+		if item.Session != nil {
+			pr := item.Session.GetPRStatusThreadSafe()
+			if pr != nil {
+				tmuxSess := item.Session.GetTmuxSession()
+				showPR := tmuxSess == nil
+				if !showPR {
+					wins := tmux.GetCachedWindows(tmuxSess.Name)
+					showPR = len(wins) < 2 || h.windowsCollapsed[item.Session.ID]
+				}
+				if showPR {
+					lines += prInfoLineCount(pr)
+				}
+			}
+		}
+	case session.ItemTypeWindow:
+		if item.IsLastWindow {
+			if sess := h.getSessionByID(item.WindowSessionID); sess != nil {
+				if pr := sess.GetPRStatusThreadSafe(); pr != nil {
+					lines += prInfoLineCount(pr)
+				}
+			}
+		}
+	}
+	return lines
+}
+
+// prInfoLineCount returns the number of lines renderSessionPRStatus writes for a given PRInfo.
+func prInfoLineCount(pr *session.PRInfo) int {
+	lines := 1 // branch line always written
+	if !pr.IsDefault && pr.Number > 0 {
+		lines++ // PR number/state line
+		if pr.FailedChecks > 0 || pr.SuccessfulChecks > 0 || pr.SkippedChecks > 0 {
+			lines++ // checks summary line
+		}
+	}
+	return lines
 }
 
 // NOTE: syncNotifications (foreground) was removed in v0.9.2 as a CPU optimization.
@@ -3263,6 +3325,14 @@ func (h *Home) processStatusUpdate(req statusUpdateRequest) {
 			if inst.GetStatusThreadSafe() != oldStatus {
 				statusChanged = true
 			}
+
+			// Update PR status for visible git-backed sessions
+			oldPR := inst.GetPRStatusThreadSafe()
+			_ = inst.RefreshPRStatus(false)
+			if inst.GetPRStatusThreadSafe() != oldPR {
+				statusChanged = true
+			}
+
 			updated[inst.ID] = true
 		}
 	}
@@ -3634,14 +3704,15 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 				h.previewCacheMu.Lock()
 				h.previewFetchingID = selected.ID
 				h.previewCacheMu.Unlock()
-				// Batch preview fetch with any OpenCode detection commands
-				allCmds := append(detectionCmds, h.fetchPreview(selected, selected.ID, -1))
+				// Batch preview fetch with PR refresh and any OpenCode detection commands
+				allCmds := append(detectionCmds, h.fetchPreview(selected, selected.ID, -1), h.refreshAllPRStatus)
 				return h, tea.Batch(allCmds...)
 			}
 			// No selection, but still run detection commands if any
 			if len(detectionCmds) > 0 {
-				return h, tea.Batch(detectionCmds...)
+				return h, tea.Batch(append(detectionCmds, h.refreshAllPRStatus)...)
 			}
+			return h, h.refreshAllPRStatus
 		}
 		return h, nil
 
@@ -5946,6 +6017,7 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					}
 				}
 			}
+			h.syncViewport()
 			h.saveInstances()
 		}
 		return h, nil
@@ -5973,6 +6045,7 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					}
 				}
 			}
+			h.syncViewport()
 			h.saveInstances()
 		}
 		return h, nil
@@ -10917,16 +10990,17 @@ func (h *Home) renderSessionList(width, height int) string {
 
 	// Render items starting from viewOffset
 	visibleCount := 0
-	maxVisible := height - 1 // Leave room for scrolling indicator
-	if maxVisible < 1 {
-		maxVisible = 1
+	renderedLines := 0
+	maxVisibleLines := height - 1 // Leave room for scrolling indicator
+	if maxVisibleLines < 1 {
+		maxVisibleLines = 1
 	}
 
 	// Show "more above" indicator if scrolled down
 	if h.viewOffset > 0 {
 		b.WriteString(DimStyle.Render(fmt.Sprintf("  ⋮ +%d above", h.viewOffset)))
 		b.WriteString("\n")
-		maxVisible-- // Account for the indicator line
+		maxVisibleLines-- // Account for the indicator line
 	}
 
 	snapshot := h.getSessionRenderSnapshot()
@@ -10936,8 +11010,10 @@ func (h *Home) renderSessionList(width, height int) string {
 		jumpHints = generateJumpHints(len(h.flatItems))
 	}
 
-	for i := h.viewOffset; i < len(h.flatItems) && visibleCount < maxVisible; i++ {
+	for i := h.viewOffset; i < len(h.flatItems) && renderedLines < maxVisibleLines; i++ {
 		item := h.flatItems[i]
+
+		var itemStr string
 		if h.jumpMode && i < len(jumpHints) {
 			// Render item to temp buffer, then overlay hint badge at name position
 			var itemBuf strings.Builder
@@ -10951,18 +11027,29 @@ func (h *Home) renderSessionList(width, height int) string {
 				itemName := jumpItemName(item)
 				// Overlay hint on the first line, preserve rest exactly
 				if idx := strings.Index(raw, "\n"); idx >= 0 {
-					b.WriteString(h.overlayJumpHint(raw[:idx], hint, h.jumpBuffer, itemName))
-					b.WriteString(raw[idx:]) // includes \n and any subsequent lines
+					itemStr = h.overlayJumpHint(raw[:idx], hint, h.jumpBuffer, itemName) + raw[idx:]
 				} else {
-					b.WriteString(h.overlayJumpHint(raw, hint, h.jumpBuffer, itemName))
+					itemStr = h.overlayJumpHint(raw, hint, h.jumpBuffer, itemName)
 				}
 			} else {
 				// Non-matching: render normally (no dimming to preserve layout)
-				b.WriteString(raw)
+				itemStr = raw
 			}
 		} else {
-			h.renderItem(&b, item, i == h.cursor, i, groupStats, snapshot)
+			var itemBuf strings.Builder
+			h.renderItem(&itemBuf, item, i == h.cursor, i, groupStats, snapshot)
+			itemStr = itemBuf.String()
 		}
+
+		itemLines := strings.Count(itemStr, "\n")
+		// If this item would exceed the visible height, stop here
+		// (unless it's the first item, in which case we show at least one line)
+		if renderedLines+itemLines > maxVisibleLines && renderedLines > 0 {
+			break
+		}
+
+		b.WriteString(itemStr)
+		renderedLines += itemLines
 		visibleCount++
 	}
 
@@ -11048,13 +11135,161 @@ func (h *Home) renderItem(
 			h.renderCreatingSessionItem(b, item, selected)
 		} else {
 			h.renderSessionItem(b, item, selected, snapshot)
+			// If session has no windows or they are collapsed, render PR status here
+			if item.Session != nil {
+				tmuxSess := item.Session.GetTmuxSession()
+				if tmuxSess == nil {
+					// No tmux session yet, but we can still show branch/local changes
+					h.renderSessionPRStatus(b, item, item.Session)
+				} else {
+					wins := tmux.GetCachedWindows(tmuxSess.Name)
+					if len(wins) < 2 || h.windowsCollapsed[item.Session.ID] {
+						h.renderSessionPRStatus(b, item, item.Session)
+					}
+				}
+			}
 		}
 	case session.ItemTypeWindow:
 		h.renderWindowItem(b, item, selected)
+		// If this is the last window of the session, render the PR status below it
+		if item.IsLastWindow {
+			if sess := h.getSessionByID(item.WindowSessionID); sess != nil {
+				h.renderSessionPRStatus(b, item, sess)
+			}
+		}
 	case session.ItemTypeRemoteGroup:
 		h.renderRemoteGroupItem(b, item, selected)
 	case session.ItemTypeRemoteSession:
 		h.renderRemoteSessionItem(b, item, selected)
+	}
+}
+
+func (h *Home) getSessionByID(id string) *session.Instance {
+	// Use h.flatItems to find the session instance from its ID
+	for _, item := range h.flatItems {
+		if item.Type == session.ItemTypeSession && item.Session != nil && item.Session.ID == id {
+			return item.Session
+		}
+	}
+	return nil
+}
+
+// renderSessionPRStatus renders the Git/GitHub PR status lines for a session.
+// It is called either immediately after renderSessionItem (if no windows shown)
+// or after the last renderWindowItem for that session.
+func (h *Home) renderSessionPRStatus(b *strings.Builder, item session.Item, inst *session.Instance) {
+	pr := inst.GetPRStatusThreadSafe()
+	if pr == nil {
+		return
+	}
+
+	treeStyle := TreeConnectorStyle
+	// Use item.Level from the session or window item.
+	// For windows, item.Level is session.Level + 1, so we decrement it
+	// to align with the parent session's tree line.
+	level := item.Level
+	if item.Type == session.ItemTypeWindow {
+		level = item.Level - 1
+	}
+
+	// Calculate base indentation for parent levels
+	baseIndent := ""
+	if level > 1 {
+		// Use tree line continuation from ParentIsLastInGroup (for both session and window items)
+		groupIndent := strings.Repeat(treeEmpty, level-2)
+		if item.ParentIsLastInGroup {
+			baseIndent = groupIndent + "   "
+		} else {
+			baseIndent = groupIndent + " " + treeStyle.Render("│") + " "
+		}
+	}
+
+	// Indentation for status lines: baseIndent + selectionPrefix (1) + tree area (3 chars) + status area (2 chars)
+	// (Matching the spacing in row construction)
+	prIndent := baseIndent + "      "
+	if !item.IsLastInGroup {
+		// If not last in group, we need a │ continuation line at the session level
+		// Add leading space to align │ at position 1 (under ├ or │ of session row)
+		prIndent = baseIndent + " " + treeStyle.Render("│") + "    "
+	}
+
+	// Line 1: <branch name> <changes>
+	branchLine := prIndent + pr.Branch
+	if pr.LocalAdditions > 0 || pr.LocalDeletions > 0 {
+		branchLine += " "
+		if pr.LocalAdditions > 0 {
+			branchLine += lipgloss.NewStyle().Foreground(ColorGreen).Render(fmt.Sprintf("+%d", pr.LocalAdditions))
+		}
+		if pr.LocalAdditions > 0 && pr.LocalDeletions > 0 {
+			branchLine += " "
+		}
+		if pr.LocalDeletions > 0 {
+			branchLine += lipgloss.NewStyle().Foreground(ColorRed).Render(fmt.Sprintf("-%d", pr.LocalDeletions))
+		}
+	}
+	b.WriteString(branchLine + "\n")
+
+	// Only show PR details if it's not the default branch and we have a PR number
+	if !pr.IsDefault && pr.Number > 0 {
+		// Line 2: PR #<number> • <pr status> (<review icon>)
+		prColor := ColorYellow
+		if pr.State == "MERGED" {
+			prColor = ColorGreen
+		} else if pr.State == "CLOSED" {
+			prColor = ColorRed
+		}
+
+		reviewIcon := ""
+		decisionStyle := lipgloss.NewStyle().Foreground(ColorYellow)
+		if pr.ReviewDecision == "APPROVED" {
+			reviewIcon = " ✔"
+			decisionStyle = lipgloss.NewStyle().Foreground(ColorGreen)
+		} else if pr.ReviewDecision == "CHANGES_REQUESTED" {
+			reviewIcon = " ✘"
+			decisionStyle = lipgloss.NewStyle().Foreground(ColorRed)
+		}
+
+		prLine := fmt.Sprintf("%sPR #%d • %s%s",
+			prIndent,
+			pr.Number,
+			lipgloss.NewStyle().Foreground(prColor).Render(pr.State),
+			decisionStyle.Render(reviewIcon),
+		)
+
+		// PR additions and deletions
+		if pr.PRAdditions > 0 || pr.PRDeletions > 0 {
+			prLine += " • "
+			if pr.PRAdditions > 0 {
+				prLine += lipgloss.NewStyle().Foreground(ColorGreen).Render(fmt.Sprintf("+%d", pr.PRAdditions))
+			}
+			if pr.PRAdditions > 0 && pr.PRDeletions > 0 {
+				prLine += " "
+			}
+			if pr.PRDeletions > 0 {
+				prLine += lipgloss.NewStyle().Foreground(ColorRed).Render(fmt.Sprintf("-%d", pr.PRDeletions))
+			}
+		}
+		b.WriteString(prLine + "\n")
+
+		// Line 3: Checks summary
+		checksParts := []string{}
+		if pr.FailedChecks > 0 {
+			checksParts = append(checksParts, lipgloss.NewStyle().Foreground(ColorRed).Render(fmt.Sprintf("%d failed", pr.FailedChecks)))
+		}
+		if pr.SuccessfulChecks > 0 {
+			checksParts = append(checksParts, lipgloss.NewStyle().Foreground(ColorGreen).Render(fmt.Sprintf("%d successful", pr.SuccessfulChecks)))
+		}
+		if pr.SkippedChecks > 0 {
+			checksParts = append(checksParts, lipgloss.NewStyle().Foreground(ColorComment).Render(fmt.Sprintf("%d skipped", pr.SkippedChecks)))
+		}
+
+		if len(checksParts) > 0 {
+			checksLine := fmt.Sprintf("%sChecks: %s\n",
+				prIndent,
+				strings.Join(checksParts, ", "),
+			)
+			b.WriteString(checksLine)
+		}
 	}
 }
 
@@ -11535,6 +11770,41 @@ func (h *Home) renderWindowItem(b *strings.Builder, item session.Item, selected 
 	)
 	b.WriteString(row)
 	b.WriteString("\n")
+}
+
+// refreshAllPRStatus triggers an immediate, forced PR status refresh for all instances.
+// This is used on startup to ensure GitHub stats are shown as soon as possible.
+func (h *Home) refreshAllPRStatus() tea.Msg {
+	h.instancesMu.RLock()
+	instances := make([]*session.Instance, len(h.instances))
+	copy(instances, h.instances)
+	h.instancesMu.RUnlock()
+
+	// Use a wait group to run all checks in parallel (fast startup)
+	var wg sync.WaitGroup
+	for _, inst := range instances {
+		wg.Add(1)
+		go func(i *session.Instance) {
+			defer wg.Done()
+			_ = i.RefreshPRStatus(true) // Force = true to bypass startup rate limit
+		}(inst)
+	}
+
+	// Wait for all to complete (or time out after 10s to not block UI forever)
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// All complete
+	case <-time.After(10 * time.Second):
+		// Some might still be running, but we've waited enough for startup
+	}
+
+	return statusUpdateMsg{} // Trigger UI refresh
 }
 
 // renderLaunchingState renders the animated launching/resuming indicator for sessions
