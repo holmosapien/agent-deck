@@ -3745,6 +3745,59 @@ func (h *Home) syncViewport() {
 	}
 }
 
+// prExtraLines returns the extra terminal lines an item spends on the
+// Git/GitHub PR block, on top of the row height the sidebar density machinery
+// already charges it. renderSessionPRStatus draws these lines in every layout,
+// including the classic one-line-per-row sidebar, so the viewport and render
+// budgets must count them or the list overflows its pane.
+// Mirrors the rendering logic in renderItem/renderSessionPRStatus.
+func (h *Home) prExtraLines(item session.Item) int {
+	switch item.Type {
+	case session.ItemTypeSession:
+		// A row still being created renders through renderCreatingSessionItem,
+		// which draws no PR block.
+		if item.Session == nil || item.CreatingID != "" {
+			return 0
+		}
+		pr := item.Session.GetPRStatusThreadSafe()
+		if pr == nil {
+			return 0
+		}
+		tmuxSess := item.Session.GetTmuxSession()
+		showPR := tmuxSess == nil
+		if !showPR {
+			wins := tmux.GetCachedWindows(tmuxSess.Name)
+			showPR = len(wins) < 2 || h.windowsCollapsed[item.Session.ID]
+		}
+		if !showPR {
+			return 0
+		}
+		return prInfoLineCount(pr)
+	case session.ItemTypeWindow:
+		if !item.IsLastWindow {
+			return 0
+		}
+		if sess := h.getSessionByID(item.WindowSessionID); sess != nil {
+			if pr := sess.GetPRStatusThreadSafe(); pr != nil {
+				return prInfoLineCount(pr)
+			}
+		}
+	}
+	return 0
+}
+
+// prInfoLineCount returns the number of lines renderSessionPRStatus writes for a given PRInfo.
+func prInfoLineCount(pr *session.PRInfo) int {
+	lines := 1 // branch line always written
+	if !pr.IsDefault && pr.Number > 0 {
+		lines++ // PR number/state line
+		if pr.FailedChecks > 0 || pr.SuccessfulChecks > 0 || pr.SkippedChecks > 0 {
+			lines++ // checks summary line
+		}
+	}
+	return lines
+}
+
 // NOTE: syncNotifications (foreground) was removed in v0.9.2 as a CPU optimization.
 // All notification sync is now handled by syncNotificationsBackground() which runs
 // every 2s in the background worker, including during tea.Exec pauses.
@@ -7107,6 +7160,15 @@ func (h *Home) processStatusUpdate(req statusUpdateRequest) {
 		if inst.GetStatusThreadSafe() != oldStatus {
 			statusChanged = true
 		}
+
+		// Update PR status for visible git-backed sessions. Kept inside the
+		// budgeted loop (not the collection pass above) so `gh` round-trips
+		// obey the same per-pass cap as UpdateStatus — see #1753.
+		oldPR := inst.GetPRStatusThreadSafe()
+		_ = inst.RefreshPRStatus(false)
+		if inst.GetPRStatusThreadSafe() != oldPR {
+			statusChanged = true
+		}
 		if ts := inst.GetTmuxSession(); ts != nil {
 			h.visibleRefreshFingerprint[inst.ID] = ts.GetCachedWindowActivity()
 		}
@@ -7763,14 +7825,15 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 				h.previewCacheMu.Lock()
 				h.previewFetchingID = selected.ID
 				h.previewCacheMu.Unlock()
-				// Batch preview fetch with any OpenCode detection commands
-				allCmds := append(detectionCmds, h.fetchPreview(selected, selected.ID, -1))
+				// Batch preview fetch with PR refresh and any OpenCode detection commands
+				allCmds := append(detectionCmds, h.fetchPreview(selected, selected.ID, -1), h.refreshAllPRStatus)
 				return h, tea.Batch(allCmds...)
 			}
 			// No selection, but still run detection commands if any
 			if len(detectionCmds) > 0 {
-				return h, tea.Batch(detectionCmds...)
+				return h, tea.Batch(append(detectionCmds, h.refreshAllPRStatus)...)
 			}
+			return h, h.refreshAllPRStatus
 		}
 		return h, nil
 
@@ -11620,6 +11683,7 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					}
 				}
 			}
+			h.syncViewport()
 			// Explicit user reorder MUST persist. saveInstances() (force=false)
 			// silently skips during a reload and aborts when the DB was touched
 			// externally (CLI hooks, status heartbeats, conductors); the ensuing
@@ -11656,6 +11720,7 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					}
 				}
 			}
+			h.syncViewport()
 			// Explicit user reorder MUST persist — see shift+up above. Fixes #1582.
 			h.forceSaveInstances()
 		}
@@ -21176,9 +21241,28 @@ func (h *Home) renderItem(
 			h.renderCreatingSessionItem(b, item, selected)
 		} else {
 			h.renderSessionItem(b, item, selected, snapshot, listWidth)
+			// If session has no windows or they are collapsed, render PR status here
+			if item.Session != nil {
+				tmuxSess := item.Session.GetTmuxSession()
+				if tmuxSess == nil {
+					// No tmux session yet, but we can still show branch/local changes
+					h.renderSessionPRStatus(b, item, item.Session)
+				} else {
+					wins := tmux.GetCachedWindows(tmuxSess.Name)
+					if len(wins) < 2 || h.windowsCollapsed[item.Session.ID] {
+						h.renderSessionPRStatus(b, item, item.Session)
+					}
+				}
+			}
 		}
 	case session.ItemTypeWindow:
 		h.renderWindowItem(b, item, selected)
+		// If this is the last window of the session, render the PR status below it
+		if item.IsLastWindow {
+			if sess := h.getSessionByID(item.WindowSessionID); sess != nil {
+				h.renderSessionPRStatus(b, item, sess)
+			}
+		}
 	case session.ItemTypeRemoteGroup:
 		h.renderRemoteGroupItem(b, item, selected, listWidth)
 	case session.ItemTypeRemoteSession:
@@ -21208,6 +21292,135 @@ func (h *Home) renderDivider(b *strings.Builder, item session.Item) {
 	}
 	b.WriteString(DimStyle.Render(line))
 	b.WriteString("\n")
+}
+
+func (h *Home) getSessionByID(id string) *session.Instance {
+	// Use h.flatItems to find the session instance from its ID
+	for _, item := range h.flatItems {
+		if item.Type == session.ItemTypeSession && item.Session != nil && item.Session.ID == id {
+			return item.Session
+		}
+	}
+	return nil
+}
+
+// renderSessionPRStatus renders the Git/GitHub PR status lines for a session.
+// It is called either immediately after renderSessionItem (if no windows shown)
+// or after the last renderWindowItem for that session.
+func (h *Home) renderSessionPRStatus(b *strings.Builder, item session.Item, inst *session.Instance) {
+	pr := inst.GetPRStatusThreadSafe()
+	if pr == nil {
+		return
+	}
+
+	treeStyle := TreeConnectorStyle
+	// Use item.Level from the session or window item.
+	// For windows, item.Level is session.Level + 1, so we decrement it
+	// to align with the parent session's tree line.
+	level := item.Level
+	if item.Type == session.ItemTypeWindow {
+		level = item.Level - 1
+	}
+
+	// Calculate base indentation for parent levels
+	baseIndent := ""
+	if level > 1 {
+		// Use tree line continuation from ParentIsLastInGroup (for both session and window items)
+		groupIndent := strings.Repeat(treeEmpty, level-2)
+		if item.ParentIsLastInGroup {
+			baseIndent = groupIndent + "   "
+		} else {
+			baseIndent = groupIndent + " " + treeStyle.Render("│") + " "
+		}
+	}
+
+	// Indentation for status lines: baseIndent + selectionPrefix (1) + tree area (3 chars) + status area (2 chars)
+	// (Matching the spacing in row construction)
+	prIndent := baseIndent + "      "
+	if !item.IsLastInGroup {
+		// If not last in group, we need a │ continuation line at the session level
+		// Add leading space to align │ at position 1 (under ├ or │ of session row)
+		prIndent = baseIndent + " " + treeStyle.Render("│") + "    "
+	}
+
+	// Line 1: <branch name> <changes>
+	branchLine := prIndent + pr.Branch
+	if pr.LocalAdditions > 0 || pr.LocalDeletions > 0 {
+		branchLine += " "
+		if pr.LocalAdditions > 0 {
+			branchLine += lipgloss.NewStyle().Foreground(ColorGreen).Render(fmt.Sprintf("+%d", pr.LocalAdditions))
+		}
+		if pr.LocalAdditions > 0 && pr.LocalDeletions > 0 {
+			branchLine += " "
+		}
+		if pr.LocalDeletions > 0 {
+			branchLine += lipgloss.NewStyle().Foreground(ColorRed).Render(fmt.Sprintf("-%d", pr.LocalDeletions))
+		}
+	}
+	b.WriteString(branchLine + "\n")
+
+	// Only show PR details if it's not the default branch and we have a PR number
+	if !pr.IsDefault && pr.Number > 0 {
+		// Line 2: PR #<number> • <pr status> (<review icon>)
+		prColor := ColorYellow
+		if pr.State == "MERGED" {
+			prColor = ColorGreen
+		} else if pr.State == "CLOSED" {
+			prColor = ColorRed
+		}
+
+		reviewIcon := ""
+		decisionStyle := lipgloss.NewStyle().Foreground(ColorYellow)
+		if pr.ReviewDecision == "APPROVED" {
+			reviewIcon = " ✔"
+			decisionStyle = lipgloss.NewStyle().Foreground(ColorGreen)
+		} else if pr.ReviewDecision == "CHANGES_REQUESTED" {
+			reviewIcon = " ✘"
+			decisionStyle = lipgloss.NewStyle().Foreground(ColorRed)
+		}
+
+		prLine := fmt.Sprintf("%sPR #%d • %s%s",
+			prIndent,
+			pr.Number,
+			lipgloss.NewStyle().Foreground(prColor).Render(pr.State),
+			decisionStyle.Render(reviewIcon),
+		)
+
+		// PR additions and deletions
+		if pr.PRAdditions > 0 || pr.PRDeletions > 0 {
+			prLine += " • "
+			if pr.PRAdditions > 0 {
+				prLine += lipgloss.NewStyle().Foreground(ColorGreen).Render(fmt.Sprintf("+%d", pr.PRAdditions))
+			}
+			if pr.PRAdditions > 0 && pr.PRDeletions > 0 {
+				prLine += " "
+			}
+			if pr.PRDeletions > 0 {
+				prLine += lipgloss.NewStyle().Foreground(ColorRed).Render(fmt.Sprintf("-%d", pr.PRDeletions))
+			}
+		}
+		b.WriteString(prLine + "\n")
+
+		// Line 3: Checks summary
+		checksParts := []string{}
+		if pr.FailedChecks > 0 {
+			checksParts = append(checksParts, lipgloss.NewStyle().Foreground(ColorRed).Render(fmt.Sprintf("%d failed", pr.FailedChecks)))
+		}
+		if pr.SuccessfulChecks > 0 {
+			checksParts = append(checksParts, lipgloss.NewStyle().Foreground(ColorGreen).Render(fmt.Sprintf("%d successful", pr.SuccessfulChecks)))
+		}
+		if pr.SkippedChecks > 0 {
+			checksParts = append(checksParts, lipgloss.NewStyle().Foreground(ColorComment).Render(fmt.Sprintf("%d skipped", pr.SkippedChecks)))
+		}
+
+		if len(checksParts) > 0 {
+			checksLine := fmt.Sprintf("%sChecks: %s\n",
+				prIndent,
+				strings.Join(checksParts, ", "),
+			)
+			b.WriteString(checksLine)
+		}
+	}
 }
 
 // renderGroupItem renders a group header
@@ -21848,6 +22061,41 @@ func (h *Home) renderWindowItem(b *strings.Builder, item session.Item, selected 
 	)
 	b.WriteString(row)
 	b.WriteString("\n")
+}
+
+// refreshAllPRStatus triggers an immediate, forced PR status refresh for all instances.
+// This is used on startup to ensure GitHub stats are shown as soon as possible.
+func (h *Home) refreshAllPRStatus() tea.Msg {
+	h.instancesMu.RLock()
+	instances := make([]*session.Instance, len(h.instances))
+	copy(instances, h.instances)
+	h.instancesMu.RUnlock()
+
+	// Use a wait group to run all checks in parallel (fast startup)
+	var wg sync.WaitGroup
+	for _, inst := range instances {
+		wg.Add(1)
+		go func(i *session.Instance) {
+			defer wg.Done()
+			_ = i.RefreshPRStatus(true) // Force = true to bypass startup rate limit
+		}(inst)
+	}
+
+	// Wait for all to complete (or time out after 10s to not block UI forever)
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// All complete
+	case <-time.After(10 * time.Second):
+		// Some might still be running, but we've waited enough for startup
+	}
+
+	return statusUpdateMsg{} // Trigger UI refresh
 }
 
 // renderLaunchingState renders the animated launching/resuming indicator for sessions

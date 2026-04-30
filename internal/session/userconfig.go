@@ -288,6 +288,9 @@ type UserConfig struct {
 	// UI defines TUI layout settings (split ratios, etc).
 	UI UISettings `toml:"ui,omitempty"`
 
+	// GitHub defines GitHub CLI integration settings.
+	GitHub GitHubSettings `toml:"github,omitempty"`
+
 	// Launch defines settings applied to every session spawn regardless of
 	// tool (identity injection, ...). See LaunchSettings.
 	Launch LaunchSettings `toml:"launch,omitempty"`
@@ -960,6 +963,12 @@ type TelemetrySettings struct {
 	// Endpoint overrides the HTTPS receiver URL for self-hosting. Plain http
 	// is accepted only for localhost. Empty uses the compiled-in default.
 	Endpoint string `toml:"endpoint,omitempty"`
+}
+
+// GitHubSettings configures GitHub CLI integration.
+type GitHubSettings struct {
+	// ShowStats enables GitHub CLI integration (stats, PR info)
+	ShowStats bool `toml:"show_stats"`
 }
 
 // OpenClawSettings configures the OpenClaw gateway connection.
@@ -5184,6 +5193,12 @@ func CreateExampleConfig() error {
 # [groups."clients/acme".deepseek]
 # command = "/opt/acme/bin/dsh-wrapper"
 # profile = "headless"
+
+# GitHub CLI integration
+# [github]
+# Enable GitHub CLI integration (stats, PR info) in session dashboard
+# Default: false
+# show_stats = true
 
 # Log file management
 # Agent-deck logs session output to ~/.agent-deck/logs/ for status detection

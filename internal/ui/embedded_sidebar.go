@@ -150,9 +150,9 @@ func (h *Home) sidebarItemRenderHeightAtWidth(item session.Item, width int) int 
 // a pass over the whole list) and hand it in, instead of once per row.
 func (h *Home) sidebarItemRenderHeightAtWidthLines(item session.Item, width, rowLines int) int {
 	if !h.embeddedLayout {
-		return 1
+		return 1 + h.prExtraLines(item)
 	}
-	return sidebarItemRenderHeightAtWidthDensity(item, width, rowLines)
+	return sidebarItemRenderHeightAtWidthDensity(item, width, rowLines) + h.prExtraLines(item)
 }
 
 func (h *Home) sidebarItemsHeight(items []session.Item, start, end, width int) int {
@@ -162,12 +162,19 @@ func (h *Home) sidebarItemsHeight(items []session.Item, start, end, width int) i
 // sidebarItemsHeightWithLines lets a caller that measures repeatedly (the
 // viewport loops) resolve the density once instead of per call.
 func (h *Home) sidebarItemsHeightWithLines(items []session.Item, start, end, width, rowLines int) int {
+	start = max(0, start)
+	end = min(len(items), end)
+	height := 0
 	if !h.embeddedLayout {
-		start = max(0, start)
-		end = min(len(items), end)
-		return max(0, end-start)
+		height = max(0, end-start)
+	} else {
+		height = sidebarItemsHeightDensity(items, start, end, width, rowLines)
 	}
-	return sidebarItemsHeightDensity(items, start, end, width, rowLines)
+	// The PR block is drawn in every layout, so charge it in both branches.
+	for i := start; i < end; i++ {
+		height += h.prExtraLines(items[i])
+	}
+	return height
 }
 
 // pageStepItems converts a line budget into a number of rows for the vi-style
@@ -189,7 +196,7 @@ func (h *Home) pageStepItems(lines, dir int) int {
 		if dir > 0 {
 			heightIndex = i - dir
 		}
-		height := sidebarItemRenderHeightAtWidthDensity(h.flatItems[heightIndex], sidebarWidth, rowLines)
+		height := h.sidebarItemRenderHeightAtWidthLines(h.flatItems[heightIndex], sidebarWidth, rowLines)
 		if height > lines && steps > 0 {
 			break
 		}
