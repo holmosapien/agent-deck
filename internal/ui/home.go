@@ -356,6 +356,7 @@ type Home struct {
 	isAttaching         atomic.Bool            // Prevents View() output during attach (fixes Bubble Tea Issue #431) - atomic for thread safety
 	lastRenderedFrame   string                 // Last non-empty frame View produced; re-served while isAttaching so no frame is ever black (#1753). Event-loop goroutine only.
 	statusFilter        session.Status         // Filter sessions by status ("" = all, or specific status)
+	sortMode            session.SortMode       // Runtime within-group sort applied at display time (default: actionable)
 	groupScope          string                 // Limit TUI to a specific group path ("" = all groups)
 	initialSelect       string                 // Session ID or title to preselect on first load (#709). Does NOT scope groups.
 	initialSelectDone   bool                   // Guard so preselection only fires once
@@ -1015,6 +1016,7 @@ type uiState struct {
 	CursorGroupPath string `json:"cursor_group_path,omitempty"`
 	PreviewMode     int    `json:"preview_mode"`
 	StatusFilter    string `json:"status_filter,omitempty"`
+	SortMode        int    `json:"sort_mode,omitempty"`
 	GroupViewMode   int    `json:"group_view_mode,omitempty"`
 	TimeFilterMode  int    `json:"time_filter_mode,omitempty"`
 	// Collapsed remote headers, keyed like Item.Path. Local group folds live in
@@ -3248,6 +3250,14 @@ func (h *Home) rebuildFlatItemsAt(now time.Time) {
 	h.nextTimeFilterExpiry = time.Time{}
 	h.jumpMode = false
 	h.jumpBuffer = ""
+
+	// Apply the active sort mode to each group's sessions before flattening.
+	// This is a display-only step: it modifies the in-memory slice order but
+	// never changes the stored Order field, so manual Order values survive
+	// sort-mode switches and restarts.
+	for _, group := range h.groupTree.Groups {
+		session.ApplySortMode(group.Sessions, h.sortMode)
+	}
 
 	allItems := h.groupTree.Flatten()
 	if h.embeddedLayout && h.sidebarMode == sidebarFlat {
@@ -11673,6 +11683,14 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					h.cursor = max(0, len(h.flatItems)-1)
 				}
 			case session.ItemTypeSession:
+				// Only a session's within-group position is governed by the
+				// runtime sort mode, so only this branch is gated: any other
+				// mode would re-sort the move away on the next rebuild.
+				// Remote rows (#1875) and group rows order independently of it.
+				if h.sortMode != session.SortModeManual {
+					h.setError(fmt.Errorf("switch to manual sort mode first (Z key)"))
+					return h, nil
+				}
 				if item.Session != nil {
 					sessionID := item.Session.ID
 					h.groupTree.MoveSessionUp(item.Session)
@@ -11710,6 +11728,11 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					h.cursor = max(0, len(h.flatItems)-1)
 				}
 			case session.ItemTypeSession:
+				// See the shift+up twin above.
+				if h.sortMode != session.SortModeManual {
+					h.setError(fmt.Errorf("switch to manual sort mode first (Z key)"))
+					return h, nil
+				}
 				if item.Session != nil {
 					sessionID := item.Session.ID
 					h.groupTree.MoveSessionDown(item.Session)
@@ -12960,6 +12983,15 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			h.statusFilter = FilterModeActive
 		}
 		h.rebuildFlatItems()
+		return h, nil
+
+	case "Z":
+		// Cycle sort mode: actionable -> manual -> alpha -> actionable.
+		// Upstream owns "O" (preview orientation), so the fork's sort cycle
+		// lives on "Z".
+		h.sortMode = (h.sortMode + 1) % 3
+		h.rebuildFlatItems()
+		h.saveUIState()
 		return h, nil
 
 	case FilterKeyArchived, "shift+6":
@@ -15029,6 +15061,7 @@ func (h *Home) saveUIStateErr() error {
 	state := uiState{
 		PreviewMode:            int(h.previewMode),
 		StatusFilter:           string(h.statusFilter),
+		SortMode:               int(h.sortMode),
 		GroupViewMode:          int(h.groupViewMode),
 		TimeFilterMode:         int(h.timeFilter),
 		RemoteSessionOrder:     h.remoteSessionOrder,
@@ -15111,6 +15144,10 @@ func (h *Home) loadUIState() {
 	// Apply preview mode, status filter, and group view mode immediately
 	h.previewMode = PreviewMode(state.PreviewMode)
 	h.statusFilter = session.Status(state.StatusFilter)
+	h.sortMode = session.SortMode(state.SortMode)
+	if h.sortMode < session.SortModeActionable || h.sortMode > session.SortModeAlpha {
+		h.sortMode = session.SortModeActionable
+	}
 	h.groupViewMode = session.GroupViewMode(state.GroupViewMode)
 	if h.groupViewMode < session.GroupViewNormal || h.groupViewMode >= session.GroupViewModeCount {
 		h.groupViewMode = session.GroupViewNormal
@@ -19156,6 +19193,17 @@ func overlayAtCells(base, overlay string, row, col int) string {
 	return strings.Join(baseLines, "\n")
 }
 
+// sessionsPanelTitle returns the sessions panel title (see sidebarTitle),
+// appending a sort-mode badge when the active mode is not the default
+// (actionable).
+func (h *Home) sessionsPanelTitle() string {
+	title := h.sidebarTitle()
+	if h.sortMode == session.SortModeActionable {
+		return title
+	}
+	return title + " [" + h.sortMode.String() + "]"
+}
+
 // renderPanelTitle creates a styled section title with underline
 func (h *Home) renderPanelTitle(title string, width int) string {
 	// Truncate title if it exceeds width
@@ -19664,11 +19712,11 @@ func (h *Home) renderDualColumnLayout(contentHeight int) string {
 	// Build left panel (session list) with styled title.
 	// Issue #1092: when the user just adjusted the split, briefly append
 	// the new ratio to both titles so the change is visible.
-	sessionsTitle := h.sidebarTitle()
+	sessionsTitle := h.sessionsPanelTitle()
 	previewTitle := "PREVIEW"
 	if !h.previewPctOverlayAt.IsZero() && time.Now().Before(h.previewPctOverlayAt) {
 		pct := h.getPreviewPct()
-		sessionsTitle = fmt.Sprintf("SESSIONS %d%%", 100-pct)
+		sessionsTitle = fmt.Sprintf("%s %d%%", h.sessionsPanelTitle(), 100-pct)
 		previewTitle = fmt.Sprintf("PREVIEW %d%%", pct)
 	}
 	leftTitle := h.renderPanelTitle(sessionsTitle, leftWidth)
@@ -19778,7 +19826,7 @@ func (h *Home) renderStackedLayout(totalHeight int) string {
 	}
 
 	// Session list (full width)
-	listTitle := h.renderPanelTitle(h.sidebarTitle(), h.width)
+	listTitle := h.renderPanelTitle(h.sessionsPanelTitle(), h.width)
 	listContent := h.renderSessionList(h.width, listHeight-2) // -2 for title
 	listContent = ensureExactHeight(listContent, listHeight-2)
 	b.WriteString(listTitle)
@@ -19809,7 +19857,7 @@ func (h *Home) renderSingleColumnLayout(totalHeight int) string {
 	// Full height for list
 	listHeight := totalHeight - 2 // -2 for title
 
-	listTitle := h.renderPanelTitle(h.sidebarTitle(), h.width)
+	listTitle := h.renderPanelTitle(h.sessionsPanelTitle(), h.width)
 	listContent := h.renderSessionList(h.width, listHeight)
 	listContent = ensureExactHeight(listContent, listHeight)
 

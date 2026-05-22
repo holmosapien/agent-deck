@@ -46,6 +46,7 @@ func TestSessionList_SortByActionable_RegressionFor857(t *testing.T) {
 		{ID: "stop", Title: "stopped-sess", GroupPath: "g", Order: 5, Status: session.StatusStopped, LastAccessedAt: now.Add(-5 * time.Minute)},
 	}
 
+	// Load-time path: the tree constructor sorts each group's sessions.
 	tree := session.NewGroupTree(instances)
 	group := tree.Groups["g"]
 	if group == nil {
@@ -67,6 +68,16 @@ func TestSessionList_SortByActionable_RegressionFor857(t *testing.T) {
 				i, want, statusForID(instances, want), gotIDs[i], gotIDs, wantIDs)
 		}
 	}
+
+	// Display-layer path: the TUI re-applies its runtime sort mode on every
+	// rebuildFlatItems, so SortModeActionable must reach the same order.
+	shuffled := []*session.Instance{instances[4], instances[0], instances[3], instances[1], instances[2]}
+	session.ApplySortMode(shuffled, session.SortModeActionable)
+	for i, want := range wantIDs {
+		if shuffled[i].ID != want {
+			t.Errorf("ApplySortMode position %d: want %q, got %q", i, want, shuffled[i].ID)
+		}
+	}
 }
 
 // TestSessionList_SortByActionable_TimestampTieBreak verifies the secondary
@@ -86,17 +97,13 @@ func TestSessionList_SortByActionable_TimestampTieBreak(t *testing.T) {
 		{ID: "new-run", Title: "new-r", GroupPath: "g", Order: 4, Status: session.StatusRunning, LastAccessedAt: now.Add(-1 * time.Minute)},
 	}
 
-	tree := session.NewGroupTree(instances)
-	group := tree.Groups["g"]
-	if group == nil {
-		t.Fatalf("group %q not in tree", "g")
-	}
+	session.ApplySortMode(instances, session.SortModeActionable)
 
 	// Waiting (priority 1) ranks above running (priority 2). Within each
 	// status bucket the recently-accessed session ranks first.
 	want := []string{"new-wait", "old-wait", "new-run", "old-run"}
-	got := make([]string, len(group.Sessions))
-	for i, s := range group.Sessions {
+	got := make([]string, len(instances))
+	for i, s := range instances {
 		got[i] = s.ID
 	}
 	for i := range want {

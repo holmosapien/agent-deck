@@ -145,6 +145,33 @@ func actionablePriority(s Status) int {
 	return 5
 }
 
+// SortMode is the within-group sort the TUI is currently displaying, cycled at
+// runtime with the O key. It sits ON TOP of the load-time ordering: see
+// ApplySortMode and Home.rebuildFlatItems.
+//
+// SortModeActionable defers to SortInstancesByActionable, so it honors the
+// group_sort config (creation vs actionable) and the pin bands. The other two
+// modes ignore status entirely; Flatten re-applies the pin bands afterwards via
+// stablePinPartition, so pinned rows stay pinned in every mode.
+type SortMode int
+
+const (
+	SortModeActionable SortMode = iota // defer to the configured group_sort (issue #857)
+	SortModeManual                     // user-defined Order (set by +/-/K/J reorder keys)
+	SortModeAlpha                      // alphabetical by title
+)
+
+func (m SortMode) String() string {
+	switch m {
+	case SortModeManual:
+		return "manual"
+	case SortModeAlpha:
+		return "alpha"
+	default:
+		return "actionable"
+	}
+}
+
 // pinZone maps a session to its outermost sort band (pin-sessions feature).
 // Lower bands surface higher in the group's list.
 //
@@ -275,6 +302,35 @@ func currentGroupSortMode() string {
 	return "creation"
 }
 
+// SortInstancesByOrder sorts the given slice in place by the stored Order field (manual user order).
+func SortInstancesByOrder(insts []*Instance) {
+	sort.SliceStable(insts, func(i, j int) bool {
+		return insts[i].Order < insts[j].Order
+	})
+}
+
+// SortInstancesByTitle sorts the given slice in place alphabetically by title (case-insensitive).
+func SortInstancesByTitle(insts []*Instance) {
+	sort.SliceStable(insts, func(i, j int) bool {
+		return strings.ToLower(insts[i].Title) < strings.ToLower(insts[j].Title)
+	})
+}
+
+// ApplySortMode sorts the given slice in place according to the active display
+// sort mode. Manual and alpha deliberately ignore the pin bands: Flatten runs
+// stablePinPartition over its own copies afterwards, which re-establishes the
+// bands while preserving the relative order chosen here.
+func ApplySortMode(insts []*Instance, mode SortMode) {
+	switch mode {
+	case SortModeAlpha:
+		SortInstancesByTitle(insts)
+	case SortModeManual:
+		SortInstancesByOrder(insts)
+	default: // SortModeActionable — honors group_sort config + pins
+		SortInstancesByActionable(insts)
+	}
+}
+
 // NewGroupTree creates a new group tree from instances
 func NewGroupTree(instances []*Instance) *GroupTree {
 	tree := &GroupTree{
@@ -315,7 +371,9 @@ func NewGroupTree(instances []*Instance) *GroupTree {
 	// Sort sessions within each group by actionability (issue #857).
 	// Persisted Order is preserved as the stable tie-breaker, so
 	// instances without a Status set behave identically to the prior
-	// Order-only sort.
+	// Order-only sort. The TUI layers its runtime sort mode on top of this
+	// (ApplySortMode in Home.rebuildFlatItems); non-TUI consumers of the tree
+	// (CLI, web) keep the configured group_sort ordering they had before.
 	for _, group := range tree.Groups {
 		SortInstancesByActionable(group.Sessions)
 	}
@@ -389,7 +447,9 @@ func NewGroupTreeWithGroups(instances []*Instance, storedGroups []*GroupData) *G
 	// Sort sessions within each group by actionability (issue #857).
 	// Persisted Order is preserved as the stable tie-breaker, so
 	// instances without a Status set behave identically to the prior
-	// Order-only sort.
+	// Order-only sort. The TUI layers its runtime sort mode on top of this
+	// (ApplySortMode in Home.rebuildFlatItems); non-TUI consumers of the tree
+	// (CLI, web) keep the configured group_sort ordering they had before.
 	for _, group := range tree.Groups {
 		SortInstancesByActionable(group.Sessions)
 	}
