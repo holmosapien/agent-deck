@@ -248,7 +248,8 @@ type Home struct {
 	viewOffset          int            // First visible item index (for scrolling)
 	previewScrollOffset int            // Lines scrolled up from tail in the preview pane (#574). 0 = tail (default). Reset on cursor move.
 	isAttaching         atomic.Bool    // Prevents View() output during attach (fixes Bubble Tea Issue #431) - atomic for thread safety
-	statusFilter        session.Status // Filter sessions by status ("" = all, or specific status)
+	statusFilter        session.Status   // Filter sessions by status ("" = all, or specific status)
+	sortMode            session.SortMode // How sessions are sorted within groups (default: actionable)
 	groupScope          string         // Limit TUI to a specific group path ("" = all groups)
 	initialSelect       string         // Session ID or title to preselect on first load (#709). Does NOT scope groups.
 	initialSelectDone   bool           // Guard so preselection only fires once
@@ -573,6 +574,7 @@ type uiState struct {
 	CursorGroupPath string `json:"cursor_group_path,omitempty"`
 	PreviewMode     int    `json:"preview_mode"`
 	StatusFilter    string `json:"status_filter,omitempty"`
+	SortMode        int    `json:"sort_mode,omitempty"`
 }
 
 type selectedItemIdentity struct {
@@ -1571,6 +1573,14 @@ func (h *Home) rebuildFlatItemsPreservingSelection(identity selectedItemIdentity
 func (h *Home) rebuildFlatItems() {
 	h.jumpMode = false
 	h.jumpBuffer = ""
+
+	// Apply the active sort mode to each group's sessions before flattening.
+	// This is a display-only step: it modifies the in-memory slice order but
+	// never changes the stored Order field, so manual Order values survive
+	// sort-mode switches and restarts.
+	for _, group := range h.groupTree.Groups {
+		session.ApplySortMode(group.Sessions, h.sortMode)
+	}
 
 	allItems := h.groupTree.Flatten()
 
@@ -6626,7 +6636,11 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return h, nil
 
 	case "shift+up", "ctrl+up", "+", "K":
-		// Move item up
+		// Move item up (only meaningful in manual sort mode)
+		if h.sortMode != session.SortModeManual {
+			h.setError(fmt.Errorf("switch to manual sort mode first (O key)"))
+			return h, nil
+		}
 		if h.cursor < len(h.flatItems) {
 			item := h.flatItems[h.cursor]
 			switch item.Type {
@@ -6654,7 +6668,11 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return h, nil
 
 	case "shift+down", "ctrl+down", "-", "J":
-		// Move item down
+		// Move item down (only meaningful in manual sort mode)
+		if h.sortMode != session.SortModeManual {
+			h.setError(fmt.Errorf("switch to manual sort mode first (O key)"))
+			return h, nil
+		}
 		if h.cursor < len(h.flatItems) {
 			item := h.flatItems[h.cursor]
 			switch item.Type {
@@ -7526,6 +7544,13 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			h.statusFilter = FilterModeActive
 		}
 		h.rebuildFlatItems()
+		return h, nil
+
+	case "O":
+		// Cycle sort mode: actionable → manual → alpha → actionable
+		h.sortMode = (h.sortMode + 1) % 3
+		h.rebuildFlatItems()
+		h.saveUIState()
 		return h, nil
 	}
 
@@ -8683,6 +8708,7 @@ func (h *Home) saveUIState() {
 	state := uiState{
 		PreviewMode:  int(h.previewMode),
 		StatusFilter: string(h.statusFilter),
+		SortMode:     int(h.sortMode),
 	}
 
 	// Capture cursor position
@@ -8733,9 +8759,10 @@ func (h *Home) loadUIState() {
 		return
 	}
 
-	// Apply preview mode and status filter immediately
+	// Apply preview mode, status filter, and sort mode immediately
 	h.previewMode = PreviewMode(state.PreviewMode)
 	h.statusFilter = session.Status(state.StatusFilter)
+	h.sortMode = session.SortMode(state.SortMode)
 
 	// Defer cursor restoration until flatItems are populated
 	h.pendingCursorRestore = &state
@@ -10567,6 +10594,15 @@ func (h *Home) View() string {
 }
 
 // renderPanelTitle creates a styled section title with underline
+// sessionsPanelTitle returns the "SESSIONS" panel title, appending a sort-mode
+// badge when the active mode is not the default (actionable).
+func (h *Home) sessionsPanelTitle() string {
+	if h.sortMode == session.SortModeActionable {
+		return "SESSIONS"
+	}
+	return "SESSIONS [" + h.sortMode.String() + "]"
+}
+
 func (h *Home) renderPanelTitle(title string, width int) string {
 	// Truncate title if it exceeds width
 	if len(title) > width {
@@ -10993,11 +11029,11 @@ func (h *Home) renderDualColumnLayout(contentHeight int) string {
 	// Build left panel (session list) with styled title.
 	// Issue #1092: when the user just adjusted the split, briefly append
 	// the new ratio to both titles so the change is visible.
-	sessionsTitle := "SESSIONS"
+	sessionsTitle := h.sessionsPanelTitle()
 	previewTitle := "PREVIEW"
 	if !h.previewPctOverlayAt.IsZero() && time.Now().Before(h.previewPctOverlayAt) {
 		pct := h.getPreviewPct()
-		sessionsTitle = fmt.Sprintf("SESSIONS %d%%", 100-pct)
+		sessionsTitle = fmt.Sprintf("%s %d%%", h.sessionsPanelTitle(), 100-pct)
 		previewTitle = fmt.Sprintf("PREVIEW %d%%", pct)
 	}
 	leftTitle := h.renderPanelTitle(sessionsTitle, leftWidth)
@@ -11061,7 +11097,7 @@ func (h *Home) renderStackedLayout(totalHeight int) string {
 	}
 
 	// Session list (full width)
-	listTitle := h.renderPanelTitle("SESSIONS", h.width)
+	listTitle := h.renderPanelTitle(h.sessionsPanelTitle(), h.width)
 	listContent := h.renderSessionList(h.width, listHeight-2) // -2 for title
 	listContent = ensureExactHeight(listContent, listHeight-2)
 	b.WriteString(listTitle)
@@ -11092,7 +11128,7 @@ func (h *Home) renderSingleColumnLayout(totalHeight int) string {
 	// Full height for list
 	listHeight := totalHeight - 2 // -2 for title
 
-	listTitle := h.renderPanelTitle("SESSIONS", h.width)
+	listTitle := h.renderPanelTitle(h.sessionsPanelTitle(), h.width)
 	listContent := h.renderSessionList(h.width, listHeight)
 	listContent = ensureExactHeight(listContent, listHeight)
 

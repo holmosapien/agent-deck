@@ -108,6 +108,26 @@ func actionablePriority(s Status) int {
 	return 5
 }
 
+// SortMode defines how sessions are sorted within a group.
+type SortMode int
+
+const (
+	SortModeActionable SortMode = iota // error/waiting/running first (issue #857)
+	SortModeManual                     // user-defined Order (set by +/-/K/J reorder keys)
+	SortModeAlpha                      // alphabetical by title
+)
+
+func (m SortMode) String() string {
+	switch m {
+	case SortModeManual:
+		return "manual"
+	case SortModeAlpha:
+		return "alpha"
+	default:
+		return "actionable"
+	}
+}
+
 // SortInstancesByActionable sorts the given slice in place so the most
 // recently actionable sessions surface first within a group (issue #857).
 // Key precedence:
@@ -130,6 +150,32 @@ func SortInstancesByActionable(insts []*Instance) {
 		}
 		return insts[i].Order < insts[j].Order
 	})
+}
+
+// SortInstancesByOrder sorts the given slice in place by the stored Order field (manual user order).
+func SortInstancesByOrder(insts []*Instance) {
+	sort.SliceStable(insts, func(i, j int) bool {
+		return insts[i].Order < insts[j].Order
+	})
+}
+
+// SortInstancesByTitle sorts the given slice in place alphabetically by title (case-insensitive).
+func SortInstancesByTitle(insts []*Instance) {
+	sort.SliceStable(insts, func(i, j int) bool {
+		return strings.ToLower(insts[i].Title) < strings.ToLower(insts[j].Title)
+	})
+}
+
+// ApplySortMode sorts the given slice in place according to the specified mode.
+func ApplySortMode(insts []*Instance, mode SortMode) {
+	switch mode {
+	case SortModeAlpha:
+		SortInstancesByTitle(insts)
+	case SortModeManual:
+		SortInstancesByOrder(insts)
+	default: // SortModeActionable
+		SortInstancesByActionable(insts)
+	}
 }
 
 // NewGroupTree creates a new group tree from instances
@@ -167,12 +213,13 @@ func NewGroupTree(instances []*Instance) *GroupTree {
 		group.Sessions = append(group.Sessions, inst)
 	}
 
-	// Sort sessions within each group by actionability (issue #857).
-	// Persisted Order is preserved as the stable tie-breaker, so
-	// instances without a Status set behave identically to the prior
-	// Order-only sort.
+	// Sort sessions by stored Order so the UI's active sort mode can be applied
+	// as a display-only step (see Home.rebuildFlatItems). Sorting here by Order
+	// preserves the user's manual order across restarts regardless of the active
+	// sort mode, fixing the persistence issue where SortInstancesByActionable
+	// was overriding user-set Order values every time the tree was loaded.
 	for _, group := range tree.Groups {
-		SortInstancesByActionable(group.Sessions)
+		SortInstancesByOrder(group.Sessions)
 	}
 
 	// Sort groups alphabetically and assign order
@@ -237,12 +284,10 @@ func NewGroupTreeWithGroups(instances []*Instance, storedGroups []*GroupData) *G
 		group.Sessions = append(group.Sessions, inst)
 	}
 
-	// Sort sessions within each group by actionability (issue #857).
-	// Persisted Order is preserved as the stable tie-breaker, so
-	// instances without a Status set behave identically to the prior
-	// Order-only sort.
+	// Sort sessions by stored Order so the UI's active sort mode can be applied
+	// as a display-only step (see Home.rebuildFlatItems).
 	for _, group := range tree.Groups {
-		SortInstancesByActionable(group.Sessions)
+		SortInstancesByOrder(group.Sessions)
 	}
 
 	// Rebuild group list maintaining stored order

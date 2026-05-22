@@ -44,18 +44,13 @@ func TestSessionList_SortByActionable_RegressionFor857(t *testing.T) {
 		{ID: "stop", Title: "stopped-sess", GroupPath: "g", Order: 5, Status: session.StatusStopped, LastAccessedAt: now.Add(-5 * time.Minute)},
 	}
 
-	tree := session.NewGroupTree(instances)
-	group := tree.Groups["g"]
-	if group == nil {
-		t.Fatalf("group %q not in tree", "g")
-	}
-	if len(group.Sessions) != 5 {
-		t.Fatalf("expected 5 sessions in group, got %d", len(group.Sessions))
-	}
+	// ApplySortMode with SortModeActionable should produce the actionable order
+	// regardless of the stored Order values (the whole point of issue #857).
+	session.ApplySortMode(instances, session.SortModeActionable)
 
 	wantIDs := []string{"err", "wait", "run", "idle", "stop"}
-	gotIDs := make([]string, len(group.Sessions))
-	for i, s := range group.Sessions {
+	gotIDs := make([]string, len(instances))
+	for i, s := range instances {
 		gotIDs[i] = s.ID
 	}
 
@@ -82,17 +77,13 @@ func TestSessionList_SortByActionable_TimestampTieBreak(t *testing.T) {
 		{ID: "new-run", Title: "new-r", GroupPath: "g", Order: 4, Status: session.StatusRunning, LastAccessedAt: now.Add(-1 * time.Minute)},
 	}
 
-	tree := session.NewGroupTree(instances)
-	group := tree.Groups["g"]
-	if group == nil {
-		t.Fatalf("group %q not in tree", "g")
-	}
+	session.ApplySortMode(instances, session.SortModeActionable)
 
 	// Waiting (priority 1) ranks above running (priority 2). Within each
 	// status bucket the recently-accessed session ranks first.
 	want := []string{"new-wait", "old-wait", "new-run", "old-run"}
-	got := make([]string, len(group.Sessions))
-	for i, s := range group.Sessions {
+	got := make([]string, len(instances))
+	for i, s := range instances {
 		got[i] = s.ID
 	}
 	for i := range want {

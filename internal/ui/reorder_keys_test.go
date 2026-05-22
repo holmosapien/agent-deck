@@ -27,6 +27,7 @@ func TestReorderKeysPlusMinus(t *testing.T) {
 		h.instances = instances
 		h.instancesMu.Unlock()
 		h.groupTree = session.NewGroupTree(instances)
+		h.sortMode = session.SortModeManual
 		h.rebuildFlatItems()
 		return h, instances
 	}
